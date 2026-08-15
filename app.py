@@ -57,7 +57,7 @@ if menu == "👥 Clientes":
 
     clientes = fetch_query("SELECT * FROM clientes ORDER BY apellido ASC")
     if clientes:
-        sel_c = st.selectbox("Buscar Cliente para editar/ver:", clientes, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
+        sel_c = st.selectbox("Buscar Cliente:", clientes, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
         if sel_c:
             with st.form("edit_c"):
                 st.subheader(f"Perfil de {sel_c['nombre']} {sel_c['apellido']}")
@@ -67,15 +67,10 @@ if menu == "👥 Clientes":
                 u_ed = c1.number_input("Edad", 0, 120, value=int(sel_c['edad']) if sel_c['edad'] else 0)
                 u_tel = c2.text_input("Teléfono", value=str(sel_c['telefono']) if sel_c['telefono'] else "")
                 u_em = st.text_input("Email", value=sel_c['email'])
-                
-                # Historia Clínica
                 hc_data = fetch_query("SELECT notas FROM historias_clinicas WHERE cliente_id = %s", (sel_c['id'],))
-                u_notas = st.text_area("Historia Clínica / Notas de Salud", value=hc_data[0]['notas'] if hc_data else "")
-                
+                u_notas = st.text_area("Historia Clínica", value=hc_data[0]['notas'] if hc_data else "")
                 if st.form_submit_button("Guardar Cambios"):
-                    execute_query("UPDATE clientes SET nombre=%s, apellido=%s, edad=%s, telefono=%s, email=%s WHERE id=%s", 
-                                  (u_nom, u_ape, u_ed, u_tel, u_em, sel_c['id']))
-                    # Upsert historia clínica
+                    execute_query("UPDATE clientes SET nombre=%s, apellido=%s, edad=%s, telefono=%s, email=%s WHERE id=%s", (u_nom, u_ape, u_ed, u_tel, u_em, sel_c['id']))
                     execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = EXCLUDED.notas", (sel_c['id'], u_notas))
                     st.success("Información actualizada")
                     st.rerun()
@@ -85,52 +80,49 @@ elif menu == "📅 Turnos":
     st.title("Agenda de Turnos")
     cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
     trats = fetch_query("SELECT id, nombre, precio FROM tratamientos ORDER BY nombre")
-    
-    if not cls: st.warning("Primero debes registrar clientes.")
-    elif not trats: st.info("No hay tratamientos cargados en el catálogo.")
-    else:
+    if cls and trats:
         with st.form("n_turno"):
-            c = st.selectbox("Seleccionar Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
-            ts = st.multiselect("Seleccionar Tratamiento(s)", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
+            c = st.selectbox("Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
+            ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
             col1, col2 = st.columns(2)
             fecha = col1.date_input("Día")
             hora = col2.time_input("Hora")
-            
             if st.form_submit_button("Confirmar Turno"):
                 if ts:
                     f_iso = datetime.combine(fecha, hora).strftime('%Y-%m-%d %H:%M:%S')
                     trat_resumen = ", ".join([t['nombre'] for t in ts])
-                    # Insertar Turno
-                    execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", 
-                                  (c['id'], f_iso, trat_resumen))
-                    # Actualizar Historia Clínica automáticamente
+                    execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], f_iso, trat_resumen))
                     nota_nueva = f"\n[{fecha}]: {trat_resumen}"
-                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || EXCLUDED.notas", 
-                                  (c['id'], nota_nueva))
-                    st.success("Turno agendado y registrado en historia clínica.")
+                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || EXCLUDED.notas", (c['id'], nota_nueva))
+                    st.success("Turno agendado")
                     st.rerun()
-                else:
-                    st.error("Selecciona al menos un tratamiento.")
 
-# --- SECCIÓN TRATAMIENTOS ---
+# --- SECCIÓN TRATAMIENTOS (CON EDICIÓN DE PRECIO) ---
 elif menu == "💄 Tratamientos":
     st.title("Catálogo de Tratamientos")
-    with st.form("add_t"):
-        n = st.text_input("Nombre del Servicio")
-        p = st.number_input("Precio", min_value=0.0)
-        if st.form_submit_button("Agregar"):
-            execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
-            st.success("Servicio agregado")
-            st.rerun()
-    t_df = fetch_query("SELECT * FROM tratamientos")
-    if t_df: st.dataframe(pd.DataFrame(t_df), use_container_width=True)
+    with st.expander("➕ Agregar Nuevo"):
+        with st.form("add_t"):
+            n = st.text_input("Nombre del Servicio")
+            p = st.number_input("Precio", min_value=0.0)
+            if st.form_submit_button("Agregar"):
+                execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
+                st.rerun()
+    
+    t_list = fetch_query("SELECT * FROM tratamientos ORDER BY nombre")
+    if t_list:
+        st.write("### Editar Precios")
+        sel_t = st.selectbox("Seleccionar tratamiento para actualizar valor:", t_list, format_func=lambda x: f"{x['nombre']} - Current: ${x['precio']}")
+        if sel_t:
+            with st.form("edit_t"):
+                new_p = st.number_input("Nuevo Precio", value=float(sel_t['precio']))
+                if st.form_submit_button("Actualizar Precio"):
+                    execute_query("UPDATE tratamientos SET precio = %s WHERE id = %s", (new_p, sel_t['id']))
+                    st.success("Precio actualizado")
+                    st.rerun()
+        st.dataframe(pd.DataFrame(t_list), use_container_width=True)
 
-# --- INICIO (CALENDARIO) ---
+# --- INICIO ---
 elif menu == "🏠 Inicio":
     st.title("Agenda Bella")
-    data = fetch_query("""
-        SELECT t.fecha_inicio::text as start, 
-               concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title
-        FROM turnos t JOIN clientes c ON t.cliente_id = c.id
-    """)
+    data = fetch_query("SELECT t.fecha_inicio::text as start, concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title FROM turnos t JOIN clientes c ON t.cliente_id = c.id")
     calendar(events=data, options={"locale": "es", "initialView": "timeGridWeek", "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00"})
