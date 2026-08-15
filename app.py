@@ -14,16 +14,23 @@ def get_connection():
     return psycopg2.connect(DB_URL)
 
 def fetch_query(query, params=None):
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(query, params)
-            return cur.fetchall()
+    try:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, params)
+                return cur.fetchall()
+    except Exception as e:
+        st.error(f"Error de base de datos: {e}")
+        return []
 
 def execute_query(query, params=None):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            conn.commit()
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                conn.commit()
+    except Exception as e:
+        st.error(f"Error al ejecutar: {e}")
 
 # --- NAVEGACIÓN ---
 with st.sidebar:
@@ -34,7 +41,6 @@ with st.sidebar:
 if menu == "👥 Clientes":
     st.title("Gestión de Clientes e Historias Clínicas")
     
-    # 1. CREAR CLIENTE E HISTORIA
     with st.expander("➕ Nuevo Cliente"):
         with st.form("form_nuevo_cliente"):
             c1, c2 = st.columns(2)
@@ -44,68 +50,60 @@ if menu == "👥 Clientes":
             email = c2.text_input("Email")
             if st.form_submit_button("Registrar"):
                 if nom and ape:
-                    # Insertar cliente y obtener ID generado
                     with get_connection() as conn:
                         with conn.cursor() as cur:
                             cur.execute("INSERT INTO clientes (nombre, apellido, edad, email) VALUES (%s, %s, %s, %s) RETURNING id", (nom, ape, edad, email))
                             new_id = cur.fetchone()[0]
-                            # Crear historia clínica automáticamente
                             cur.execute("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s)", (new_id, "Nueva historia creada."))
                             conn.commit()
                     st.success(f"Cliente {nom} registrado con éxito.")
+                    st.rerun()
 
-    # 2. LISTADO Y ACCIONES (EDITAR/BORRAR)
     clientes = fetch_query("SELECT * FROM clientes ORDER BY id DESC")
     if clientes:
-        df_clientes = pd.DataFrame(clientes)
         st.subheader("Listado de Clientes")
-        st.dataframe(df_clientes, use_container_width=True)
+        df_c = pd.DataFrame(clientes)
+        st.dataframe(df_c, use_container_width=True)
 
-        # Buscador/Selector para Editar o Ver Historia
         sel_c = st.selectbox("Seleccionar Cliente para gestionar:", clientes, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
         
         if sel_c:
             col_edit, col_del = st.columns(2)
-            
             with col_edit:
-                st.markdown("### 📝 Editar / Historia Clínica")
+                st.markdown("### 📝 Editar Datos / Historia")
                 with st.form("edit_c"):
                     new_nom = st.text_input("Nombre", value=sel_c['nombre'])
                     new_email = st.text_input("Email", value=sel_c['email'])
-                    # Traer notas de historia clínica
                     historia = fetch_query("SELECT notas FROM historias_clinicas WHERE cliente_id = %s", (sel_c['id'],))
                     notas_val = historia[0]['notas'] if historia else ""
-                    new_notas = st.text_area("Notas Médicas / Historia", value=notas_val)
-                    
-                    if st.form_submit_button("Actualizar Datos"):
+                    new_notas = st.text_area("Historia Clínica", value=notas_val)
+                    if st.form_submit_button("Guardar Cambios"):
                         execute_query("UPDATE clientes SET nombre=%s, email=%s WHERE id=%s", (new_nom, new_email, sel_c['id']))
                         execute_query("UPDATE historias_clinicas SET notas=%s, fecha_actualizacion=NOW() WHERE cliente_id=%s", (new_notas, sel_c['id']))
-                        st.success("Información actualizada")
+                        st.success("Información actualizada correctamente")
                         st.rerun()
-
             with col_del:
-                st.markdown("### ⚠️ Zona de Peligro")
-                if st.button("🗑️ Eliminar Cliente"):
+                st.markdown("### ⚠️ Eliminar")
+                if st.button("🗑️ Borrar Cliente Permanentemente"):
                     execute_query("DELETE FROM clientes WHERE id = %s", (sel_c['id'],))
-                    st.warning(f"Cliente {sel_c['nombre']} eliminado.")
+                    st.warning("Cliente y su historia clínica eliminados")
                     st.rerun()
 
 # --- SECCIÓN TRATAMIENTOS ---
 elif menu == "💄 Tratamientos":
     st.title("Catálogo de Servicios")
-    with st.expander("➕ Agregar Tratamiento"):
-        with st.form("n_t"):
-            n = st.text_input("Nombre del servicio")
-            p = st.number_input("Precio", min_value=0.0)
-            if st.form_submit_button("Guardar"):
-                execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
-                st.success("Agregado")
-    trats = fetch_query("SELECT * FROM tratamientos")
-    if trats: st.table(pd.DataFrame(trats))
+    with st.form("n_t"):
+        n = st.text_input("Servicio")
+        p = st.number_input("Precio", min_value=0.0)
+        if st.form_submit_button("Agregar"):
+            execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
+            st.rerun()
+    t_data = fetch_query("SELECT * FROM tratamientos")
+    if t_data: st.table(pd.DataFrame(t_data))
 
 # --- SECCIÓN TURNOS ---
 elif menu == "📅 Turnos":
-    st.title("Agenda")
+    st.title("Gestión de Turnos")
     cl = fetch_query("SELECT id, nombre, apellido FROM clientes")
     tr = fetch_query("SELECT id, nombre FROM tratamientos")
     if cl and tr:
@@ -115,13 +113,31 @@ elif menu == "📅 Turnos":
             d = st.date_input("Día")
             h = st.time_input("Hora")
             if st.form_submit_button("Agendar"):
-                execute_query("INSERT INTO turnos (cliente_id, tratamiento_id, fecha_inicio) VALUES (%s, %s, %s)", (c['id'], t['id'], f"{d} {h}"))
+                f_inicio = datetime.combine(d, h).strftime('%Y-%m-%d %H:%M:%S')
+                execute_query("INSERT INTO turnos (cliente_id, tratamiento_id, fecha_inicio) VALUES (%s, %s, %s)", (c['id'], t['id'], f_inicio))
                 st.success("Turno agendado")
 
-# --- INICIO ---
+# --- INICIO (DASHBOARD & CALENDARIO) ---
 elif menu == "🏠 Inicio":
-    st.title("Dashboard Bella")
-    turnos_data = fetch_query("""SELECT t.fecha_inicio as start, concat(c.nombre, ' - ', tr.nombre) as title 
-                                FROM turnos t JOIN clientes c ON t.cliente_id = c.id 
-                                JOIN tratamientos tr ON t.tratamiento_id = tr.id""")
-    calendar(events=turnos_data, options={"locale": "es", "initialView": "timeGridWeek", "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00"})
+    st.title("Agenda Bella")
+    
+    query = """
+        SELECT 
+            t.fecha_inicio::text as start, 
+            concat(c.nombre, ' ', c.apellido, ' - ', tr.nombre) as title
+        FROM turnos t 
+        JOIN clientes c ON t.cliente_id = c.id 
+        JOIN tratamientos tr ON t.tratamiento_id = tr.id
+    """
+    turnos_data = fetch_query(query)
+    
+    if turnos_data:
+        calendar(events=turnos_data, options={
+            "locale": "es", 
+            "initialView": "timeGridWeek", 
+            "slotMinTime": "07:00:00", 
+            "slotMaxTime": "22:00:00",
+            "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,timeGridWeek,timeGridDay"}
+        })
+    else:
+        st.info("No hay turnos agendados en el sistema.")
