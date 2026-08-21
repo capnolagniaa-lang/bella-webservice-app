@@ -119,7 +119,6 @@ elif menu == "🏠 Inicio":
             ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
             
             col_h1, col_h2 = st.columns(2)
-            # Parseamos las fechas para que el usuario pueda ajustarlas en el formulario
             dt_start = datetime.fromisoformat(t_start_iso.replace('Z', ''))
             dt_end = datetime.fromisoformat(t_end_iso.replace('Z', ''))
             
@@ -150,4 +149,4 @@ elif menu == "🏠 Inicio":
                 if btn_del:
                     execute_query("DELETE FROM turnos WHERE id = %s", (ev_id,))
                     st.warning("Turno eliminado")
-                    st.rerun()"
+                    st.rerun()
