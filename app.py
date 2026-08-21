@@ -88,9 +88,11 @@ elif menu == "📅 Turnos":
                 if ts:
                     f_iso = datetime.combine(fecha, hora).strftime('%Y-%m-%d %H:%M:%S')
                     trat_resumen = ", ".join([t['nombre'] for t in ts])
-                    # Guardamos el resumen en 'profesional' temporalmente para visualización rápida
+                    # Inserción segura sin esperar retorno de ID para evitar el error de tupla
                     execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], f_iso, trat_resumen))
-                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], f"\n[{fecha}]: {trat_resumen}"))
+                    # Actualizar Historia Clínica
+                    nota_log = f"\n[{fecha}]: Turno - {trat_resumen}"
+                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], nota_log))
                     st.success("Turno agendado correctamente")
                     st.rerun()
 
