@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime
+from datetime import datetime, timedelta
 from streamlit_calendar import calendar
 
 st.set_page_config(page_title='Bella - Gestión', layout='wide')
@@ -35,7 +35,7 @@ def execute_query(query, params=None):
 # --- NAVEGACIÓN ---
 with st.sidebar:
     st.title("✨ Bella")
-    menu = st.radio("Menú", ["🏠 Inicio", "👥 Clientes", "📅 Turnos", "💄 Tratamientos"])
+    menu = st.radio("Menú", ["🏠 Inicio", "👥 Clientes", "💄 Tratamientos"])
 
 # --- SECCIÓN CLIENTES ---
 if menu == "👥 Clientes":
@@ -73,29 +73,6 @@ if menu == "👥 Clientes":
                     st.success("Información actualizada")
                     st.rerun()
 
-# --- SECCIÓN TURNOS ---
-elif menu == "📅 Turnos":
-    st.title("Agenda de Turnos")
-    cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
-    trats = fetch_query("SELECT id, nombre, precio FROM tratamientos ORDER BY nombre")
-    if cls and trats:
-        with st.form("n_turno"):
-            c = st.selectbox("Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
-            ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
-            col1, col2 = st.columns(2)
-            fecha, hora = col1.date_input("Día"), col2.time_input("Hora")
-            if st.form_submit_button("Confirmar Turno"):
-                if ts:
-                    f_iso = datetime.combine(fecha, hora).strftime('%Y-%m-%d %H:%M:%S')
-                    trat_resumen = ", ".join([t['nombre'] for t in ts])
-                    # Inserción segura sin esperar retorno de ID para evitar el error de tupla
-                    execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], f_iso, trat_resumen))
-                    # Actualizar Historia Clínica
-                    nota_log = f"\n[{fecha}]: Turno - {trat_resumen}"
-                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], nota_log))
-                    st.success("Turno agendado correctamente")
-                    st.rerun()
-
 # --- SECCIÓN TRATAMIENTOS ---
 elif menu == "💄 Tratamientos":
     st.title("Catálogo de Tratamientos")
@@ -109,16 +86,51 @@ elif menu == "💄 Tratamientos":
     if t_list:
         df_t = pd.DataFrame(t_list)
         st.dataframe(df_t[['nombre', 'precio']], use_container_width=True)
-        sel_t = st.selectbox("Editar Precio:", t_list, format_func=lambda x: x['nombre'])
-        if sel_t:
-            with st.form("edit_t"):
-                new_p = st.number_input("Nuevo Precio", value=float(sel_t['precio']))
-                if st.form_submit_button("Actualizar"):
-                    execute_query("UPDATE tratamientos SET precio = %s WHERE id = %s", (new_p, sel_t['id']))
-                    st.rerun()
 
-# --- INICIO (CALENDARIO) ---
+# --- INICIO (CALENDARIO INTERACTIVO) ---
 elif menu == "🏠 Inicio":
     st.title("Agenda Bella")
-    data = fetch_query("SELECT t.fecha_inicio::text as start, concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title FROM turnos t JOIN clientes c ON t.cliente_id = c.id")
-    calendar(events=data, options={"locale": "es", "initialView": "timeGridWeek", "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00"})
+    
+    events = fetch_query("""
+        SELECT t.id, t.fecha_inicio::text as start, 
+               concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title,
+               t.cliente_id, t.profesional as tratamientos
+        FROM turnos t JOIN clientes c ON t.cliente_id = c.id
+    """)
+
+    cal = calendar(events=events, options={
+        "locale": "es", "initialView": "timeGridWeek", 
+        "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00",
+        "selectable": True, "editable": True
+    })
+
+    if cal.get("callback") == "dateClick" or cal.get("callback") == "select":
+        st.subheader("🆕 Nuevo Turno")
+        t_start = cal["select"]["start"] if "select" in cal else cal["dateClick"]["date"]
+        cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
+        trats = fetch_query("SELECT id, nombre, precio FROM tratamientos ORDER BY nombre")
+        
+        with st.form("cal_n_turno"):
+            c = st.selectbox("Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
+            ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
+            st.write(f"Horario seleccionado: {t_start}")
+            if st.form_submit_button("Agendar"):
+                trat_resumen = ", ".join([t['nombre'] for t in ts])
+                execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], t_start, trat_resumen))
+                execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], f"\n[{t_start}]: {trat_resumen}"))
+                st.success("Turno creado")
+                st.rerun()
+
+    elif cal.get("callback") == "eventClick":
+        st.subheader("📝 Gestionar Turno")
+        ev_id = cal["eventClick"]["event"]["id"]
+        ev_info = fetch_query("SELECT * FROM turnos WHERE id = %s", (ev_id,))
+        if ev_info:
+            with st.form("edit_del_turno"):
+                st.write(f"Turno ID: {ev_id} - {cal['eventClick']['event']['title']}")
+                st.write(f"Fecha: {ev_info[0]['fecha_inicio']}")
+                btn_del = st.form_submit_button("🗑️ Eliminar Turno")
+                if btn_del:
+                    execute_query("DELETE FROM turnos WHERE id = %s", (ev_id,))
+                    st.warning("Turno eliminado")
+                    st.rerun()
