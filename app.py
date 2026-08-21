@@ -40,12 +40,10 @@ with st.sidebar:
 # --- SECCIÓN CLIENTES ---
 if menu == "👥 Clientes":
     st.title("Gestión de Clientes")
-    
     with st.expander("➕ Nuevo Cliente"):
         with st.form("nuevo_c"):
             c1, c2 = st.columns(2)
-            nom = c1.text_input("Nombre *")
-            ape = c2.text_input("Apellido *")
+            nom, ape = c1.text_input("Nombre *"), c2.text_input("Apellido *")
             ed = c1.number_input("Edad", 0, 120)
             tel = c2.text_input("Teléfono / WhatsApp *")
             em = st.text_input("Email")
@@ -85,43 +83,39 @@ elif menu == "📅 Turnos":
             c = st.selectbox("Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
             ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
             col1, col2 = st.columns(2)
-            fecha = col1.date_input("Día")
-            hora = col2.time_input("Hora")
+            fecha, hora = col1.date_input("Día"), col2.time_input("Hora")
             if st.form_submit_button("Confirmar Turno"):
                 if ts:
                     f_iso = datetime.combine(fecha, hora).strftime('%Y-%m-%d %H:%M:%S')
                     trat_resumen = ", ".join([t['nombre'] for t in ts])
+                    # Guardamos el resumen en 'profesional' temporalmente para visualización rápida
                     execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], f_iso, trat_resumen))
-                    nota_nueva = f"\n[{fecha}]: {trat_resumen}"
-                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || EXCLUDED.notas", (c['id'], nota_nueva))
-                    st.success("Turno agendado")
+                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], f"\n[{fecha}]: {trat_resumen}"))
+                    st.success("Turno agendado correctamente")
                     st.rerun()
 
-# --- SECCIÓN TRATAMIENTOS (CON EDICIÓN DE PRECIO) ---
+# --- SECCIÓN TRATAMIENTOS ---
 elif menu == "💄 Tratamientos":
     st.title("Catálogo de Tratamientos")
     with st.expander("➕ Agregar Nuevo"):
         with st.form("add_t"):
-            n = st.text_input("Nombre del Servicio")
-            p = st.number_input("Precio", min_value=0.0)
+            n, p = st.text_input("Nombre del Servicio"), st.number_input("Precio", min_value=0.0)
             if st.form_submit_button("Agregar"):
                 execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
                 st.rerun()
-    
-    t_list = fetch_query("SELECT * FROM tratamientos ORDER BY nombre")
+    t_list = fetch_query("SELECT nombre, precio, id FROM tratamientos ORDER BY nombre")
     if t_list:
-        st.write("### Editar Precios")
-        sel_t = st.selectbox("Seleccionar tratamiento para actualizar valor:", t_list, format_func=lambda x: f"{x['nombre']} - Current: ${x['precio']}")
+        df_t = pd.DataFrame(t_list)
+        st.dataframe(df_t[['nombre', 'precio']], use_container_width=True)
+        sel_t = st.selectbox("Editar Precio:", t_list, format_func=lambda x: x['nombre'])
         if sel_t:
             with st.form("edit_t"):
                 new_p = st.number_input("Nuevo Precio", value=float(sel_t['precio']))
-                if st.form_submit_button("Actualizar Precio"):
+                if st.form_submit_button("Actualizar"):
                     execute_query("UPDATE tratamientos SET precio = %s WHERE id = %s", (new_p, sel_t['id']))
-                    st.success("Precio actualizado")
                     st.rerun()
-        st.dataframe(pd.DataFrame(t_list), use_container_width=True)
 
-# --- INICIO ---
+# --- INICIO (CALENDARIO) ---
 elif menu == "🏠 Inicio":
     st.title("Agenda Bella")
     data = fetch_query("SELECT t.fecha_inicio::text as start, concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title FROM turnos t JOIN clientes c ON t.cliente_id = c.id")
