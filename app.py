@@ -87,12 +87,13 @@ elif menu == "💄 Tratamientos":
         df_t = pd.DataFrame(t_list)
         st.dataframe(df_t[['nombre', 'precio']], use_container_width=True)
 
-# --- INICIO (CALENDARIO INTERACTIVO) ---
+# --- INICIO (CALENDARIO INTERACTIVO CON AJUSTE DE HORA) ---
 elif menu == "🏠 Inicio":
     st.title("Agenda Bella")
     
     events = fetch_query("""
         SELECT t.id, t.fecha_inicio::text as start, 
+               t.fecha_fin::text as end,
                concat(c.nombre, ' ', c.apellido, ' - ', t.profesional) as title,
                t.cliente_id, t.profesional as tratamientos
         FROM turnos t JOIN clientes c ON t.cliente_id = c.id
@@ -101,24 +102,40 @@ elif menu == "🏠 Inicio":
     cal = calendar(events=events, options={
         "locale": "es", "initialView": "timeGridWeek", 
         "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00",
-        "selectable": True, "editable": True
+        "selectable": True, "selectMirror": True, "editable": True,
+        "slotDuration": "00:15:00"
     })
 
-    if cal.get("callback") == "dateClick" or cal.get("callback") == "select":
-        st.subheader("🆕 Nuevo Turno")
-        t_start = cal["select"]["start"] if "select" in cal else cal["dateClick"]["date"]
+    if cal.get("callback") == "select":
+        st.subheader("🆕 Agendar Turno")
+        t_start_iso = cal["select"]["start"]
+        t_end_iso = cal["select"]["end"]
+        
         cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
         trats = fetch_query("SELECT id, nombre, precio FROM tratamientos ORDER BY nombre")
         
         with st.form("cal_n_turno"):
             c = st.selectbox("Cliente", cls, format_func=lambda x: f"{x['nombre']} {x['apellido']}")
             ts = st.multiselect("Tratamientos", trats, format_func=lambda x: f"{x['nombre']} (${x['precio']})")
-            st.write(f"Horario seleccionado: {t_start}")
-            if st.form_submit_button("Agendar"):
+            
+            col_h1, col_h2 = st.columns(2)
+            # Parseamos las fechas para que el usuario pueda ajustarlas en el formulario
+            dt_start = datetime.fromisoformat(t_start_iso.replace('Z', ''))
+            dt_end = datetime.fromisoformat(t_end_iso.replace('Z', ''))
+            
+            new_start = col_h1.time_input("Hora Inicio", value=dt_start.time())
+            new_end = col_h2.time_input("Hora Fin", value=dt_end.time())
+            
+            if st.form_submit_button("Confirmar Turno"):
+                final_start = datetime.combine(dt_start.date(), new_start).strftime('%Y-%m-%d %H:%M:%S')
+                final_end = datetime.combine(dt_start.date(), new_end).strftime('%Y-%m-%d %H:%M:%S')
+                
                 trat_resumen = ", ".join([t['nombre'] for t in ts])
-                execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", (c['id'], t_start, trat_resumen))
-                execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", (c['id'], f"\n[{t_start}]: {trat_resumen}"))
-                st.success("Turno creado")
+                execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, profesional) VALUES (%s, %s, %s, %s)", 
+                              (c['id'], final_start, final_end, trat_resumen))
+                execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s", 
+                              (c['id'], f"\n[{final_start}]: {trat_resumen}"))
+                st.success("Turno agendado con éxito")
                 st.rerun()
 
     elif cal.get("callback") == "eventClick":
@@ -127,10 +144,10 @@ elif menu == "🏠 Inicio":
         ev_info = fetch_query("SELECT * FROM turnos WHERE id = %s", (ev_id,))
         if ev_info:
             with st.form("edit_del_turno"):
-                st.write(f"Turno ID: {ev_id} - {cal['eventClick']['event']['title']}")
-                st.write(f"Fecha: {ev_info[0]['fecha_inicio']}")
+                st.write(f"Cliente: {cal['eventClick']['event']['title']}")
+                st.write(f"Inicio: {ev_info[0]['fecha_inicio']}")
                 btn_del = st.form_submit_button("🗑️ Eliminar Turno")
                 if btn_del:
                     execute_query("DELETE FROM turnos WHERE id = %s", (ev_id,))
                     st.warning("Turno eliminado")
-                    st.rerun()
+                    st.rerun()"
