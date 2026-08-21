@@ -100,10 +100,16 @@ elif menu == "🏠 Inicio":
     """)
 
     cal = calendar(events=events, options={
-        "locale": "es", "initialView": "timeGridWeek", 
-        "slotMinTime": "07:00:00", "slotMaxTime": "22:00:00",
-        "selectable": True, "selectMirror": True, "editable": True,
-        "slotDuration": "01:00:00"
+        "locale": "es", 
+        "initialView": "timeGridWeek", 
+        "slotMinTime": "08:00:00", 
+        "slotMaxTime": "21:00:00",
+        "selectable": True, 
+        "selectMirror": True, 
+        "editable": True,
+        "slotDuration": "01:00:00",
+        "expandRows": True,
+        "height": 800
     })
 
     if cal.get("callback") == "select":
