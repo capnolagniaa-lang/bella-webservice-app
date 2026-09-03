@@ -105,14 +105,19 @@ elif menu == "🏠 Inicio":
         "slotMaxTime": "21:00:00",
         "selectable": True,
         "editable": True,
+        "allDaySlot": False,
+        "height": "auto",
+        "expandRows": True,
+        "stickyHeaderDates": True
     }, key="bella_calendar")
 
-    # Botón explícito para agendar
+    st.markdown("--- ")
+    # Botón explícito para agendar debajo del calendario
     if st.button("➕ Agendar Nuevo Turno"):
         st.session_state.show_form = True
 
-    # Formulario de agendamiento (activado por selección en calendario o botón)
-    if cal.get("callback") == "select" or st.session_state.get('show_form'):
+    # Formulario de agendamiento
+    if cal.get("callback") == "select" or st.session_state.get('show_form', False):
         st.subheader("🆕 Agendar Turno")
         cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
         trats = fetch_query("SELECT id, nombre, precio FROM tratamientos ORDER BY nombre")
@@ -124,24 +129,32 @@ elif menu == "🏠 Inicio":
             d_input = col1.date_input("Fecha", value=datetime.now())
             h_input = col2.time_input("Hora Inicio", value=datetime.now().time())
             
-            if st.form_submit_button("Confirmar Turno"):
+            if st.form_submit_button("Confirmar e Insertar"):
                 if c and ts:
                     f_s = datetime.combine(d_input, h_input).strftime('%Y-%m-%d %H:%M:%S')
                     trat_names = ", ".join([t['nombre'] for t in ts])
-                    # Insertar turno
+                    
+                    # 1. Registrar en tabla TURNOS
                     execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", 
                                   (c['id'], f_s, trat_names))
-                    # Actualizar historia clínica
-                    execute_query("INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s) ON CONFLICT (cliente_id) DO UPDATE SET notas = historias_clinicas.notas || %s",
-                                  (c['id'], f"\n[{f_s}]: {trat_names}", f"\n[{f_s}]: {trat_names}"))
-                    st.success("Turno agendado correctamente")
+                    
+                    # 2. Apendear a HISTORIA CLÍNICA
+                    nota_append = f"\n[{f_s}] - Turno: {trat_names}"
+                    execute_query("""
+                        INSERT INTO historias_clinicas (cliente_id, notas) 
+                        VALUES (%s, %s) 
+                        ON CONFLICT (cliente_id) 
+                        DO UPDATE SET notas = historias_clinicas.notas || %s
+                    """, (c['id'], nota_append, nota_append))
+                    
+                    st.success("Turno agendado y registrado en historia clínica.")
                     st.session_state.show_form = False
                     st.rerun()
                 else:
-                    st.error("Selecciona cliente y al menos un tratamiento.")
+                    st.error("Seleccione cliente y tratamientos.")
 
     if cal.get("callback") == "eventClick":
-        st.info(f"Turno seleccionado: {cal['eventClick']['event']['title']}")
+        st.info(f"Turno: {cal['eventClick']['event']['title']}")
         if st.button("🗑️ Eliminar este turno"):
             execute_query("DELETE FROM turnos WHERE id = %s", (cal["eventClick"]["event"]["id"],))
-            st.rerun()
+            st.rerun()"
