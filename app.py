@@ -76,12 +76,6 @@ if menu == "👥 Clientes":
 # --- SECCIÓN TRATAMIENTOS ---
 elif menu == "💄 Tratamientos":
     st.title("Catálogo de Tratamientos")
-    with st.expander("➕ Agregar Nuevo"):
-        with st.form("add_t"):
-            n, p = st.text_input("Nombre del Servicio"), st.number_input("Precio", min_value=0.0)
-            if st.form_submit_button("Agregar"):
-                execute_query("INSERT INTO tratamientos (nombre, precio) VALUES (%s, %s)", (n, p))
-                st.rerun()
     t_list = fetch_query("SELECT nombre, precio, id FROM tratamientos ORDER BY nombre")
     if t_list:
         df_t = pd.DataFrame(t_list)
@@ -90,7 +84,6 @@ elif menu == "💄 Tratamientos":
 # --- INICIO (CALENDARIO) ---
 elif menu == "🏠 Inicio":
     st.title("Agenda Bella")
-
     events = fetch_query("""
         SELECT t.id, t.fecha_inicio::text as start, 
                COALESCE(t.fecha_fin, t.fecha_inicio + interval '1 hour')::text as end,
@@ -107,16 +100,13 @@ elif menu == "🏠 Inicio":
         "editable": True,
         "allDaySlot": False,
         "height": "auto",
-        "expandRows": True,
-        "stickyHeaderDates": True
+        "expandRows": True
     }, key="bella_calendar")
 
     st.markdown("--- ")
-    # Botón explícito para agendar debajo del calendario
     if st.button("➕ Agendar Nuevo Turno"):
         st.session_state.show_form = True
 
-    # Formulario de agendamiento
     if cal.get("callback") == "select" or st.session_state.get('show_form', False):
         st.subheader("🆕 Agendar Turno")
         cls = fetch_query("SELECT id, nombre, apellido FROM clientes ORDER BY nombre")
@@ -133,12 +123,8 @@ elif menu == "🏠 Inicio":
                 if c and ts:
                     f_s = datetime.combine(d_input, h_input).strftime('%Y-%m-%d %H:%M:%S')
                     trat_names = ", ".join([t['nombre'] for t in ts])
-                    
-                    # 1. Registrar en tabla TURNOS
                     execute_query("INSERT INTO turnos (cliente_id, fecha_inicio, profesional) VALUES (%s, %s, %s)", 
                                   (c['id'], f_s, trat_names))
-                    
-                    # 2. Apendear a HISTORIA CLÍNICA
                     nota_append = f"\n[{f_s}] - Turno: {trat_names}"
                     execute_query("""
                         INSERT INTO historias_clinicas (cliente_id, notas) 
@@ -146,15 +132,20 @@ elif menu == "🏠 Inicio":
                         ON CONFLICT (cliente_id) 
                         DO UPDATE SET notas = historias_clinicas.notas || %s
                     """, (c['id'], nota_append, nota_append))
-                    
-                    st.success("Turno agendado y registrado en historia clínica.")
+                    st.success("Turno agendado correctamente")
                     st.session_state.show_form = False
                     st.rerun()
-                else:
-                    st.error("Seleccione cliente y tratamientos.")
 
     if cal.get("callback") == "eventClick":
         st.info(f"Turno: {cal['eventClick']['event']['title']}")
         if st.button("🗑️ Eliminar este turno"):
             execute_query("DELETE FROM turnos WHERE id = %s", (cal["eventClick"]["event"]["id"],))
-            st.rerun()"
+            st.rerun()
+
+    st.markdown("--- ")
+    st.subheader("📘 Instructivo: Gestión de Turnos")
+    st.info("**¿Cómo agendar?** Puedes hacer clic en el botón verde 'Agendar Nuevo Turno' o arrastrar directamente sobre el calendario.\n\n" 
+            "**¿Qué sucede al confirmar?**\n" 
+            "1. Se crea un evento visual en el calendario.\n" 
+            "2. Se guarda el registro en la base de datos de Render.\n" 
+            "3. Se escribe automáticamente una nota en la **Historia Clínica** del paciente con la fecha y el servicio realizado.")
