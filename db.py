@@ -1,7 +1,6 @@
 """Acceso a PostgreSQL (Render).
 
-- La URL se lee de la variable de entorno DATABASE_URL o de st.secrets["DATABASE_URL"].
-  Nunca debe quedar escrita en el código.
+- La URL se toma de DATABASE_URL (variable de entorno o st.secrets) o de DEFAULT_DATABASE_URL.
 - Render exige SSL en conexiones externas: se fuerza sslmode=require.
 - Pool de conexiones con keepalives, verificación de conexiones ociosas y
   reintentos. Esto evita el error "SSL connection has been closed unexpectedly"
@@ -17,6 +16,12 @@ import psycopg2
 import streamlit as st
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
+
+# Si existe la variable DATABASE_URL (o el secret), tiene prioridad sobre esta URL.
+DEFAULT_DATABASE_URL = (
+    "postgresql://bella:y5eg7N4rtj4uH5CR3lAogmzkq9MGvHXF"
+    "@dpg-db740he7bikc73a3oeqg-a.virginia-postgres.render.com/belladb_i62l"
+)
 
 _BROKEN = (psycopg2.OperationalError, psycopg2.InterfaceError)
 _IDLE_CHECK_SECONDS = 60
@@ -34,7 +39,7 @@ def database_url():
             url = st.secrets.get("DATABASE_URL")
         except Exception:  # no existe secrets.toml
             url = None
-    return url
+    return url or DEFAULT_DATABASE_URL
 
 
 def _friendly(error):
@@ -177,6 +182,7 @@ _MIGRATIONS = [
         edad INTEGER, telefono TEXT, email TEXT)""",
     "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS fecha_nacimiento DATE",
     "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS origen TEXT",
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS domicilio TEXT",
     "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS acepta_mensajes BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP",
     "ALTER TABLE clientes ALTER COLUMN creado_en SET DEFAULT (now() AT TIME ZONE 'America/Argentina/Buenos_Aires')",

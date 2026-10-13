@@ -211,7 +211,7 @@ def q_config():
 def q_clientes():
     return db.fetch(
         """SELECT id, nombre, apellido, edad, telefono, email, fecha_nacimiento, origen,
-                  acepta_mensajes, creado_en
+                  acepta_mensajes, creado_en, domicilio
            FROM clientes ORDER BY apellido, nombre"""
     )
 
@@ -257,19 +257,24 @@ def df_turnos():
 
 def df_clientes():
     cl = pd.DataFrame(q_clientes(), columns=["id", "nombre", "apellido", "edad", "telefono", "email",
-                                             "fecha_nacimiento", "origen", "acepta_mensajes", "creado_en"])
+                                             "fecha_nacimiento", "origen", "acepta_mensajes", "creado_en",
+                                             "domicilio"])
     t = df_turnos()
     now = pd.Timestamp(ahora())
     visitas = t[t["estado"].isin(OCUPAN_AGENDA) & (t["inicio"] <= now)]
     completados = t[t["estado"] == "completado"]
     futuros = t[t["estado"].isin(PENDIENTES) & (t["inicio"] > now)]
 
+    def por_cliente(serie):
+        # Se mapea con un dict: con Series vacías de fechas, pandas falla al alinear tipos.
+        return cl["id"].map(serie.to_dict())
+
     cl["cliente"] = cl["nombre"] + " " + cl["apellido"]
-    cl["visitas"] = cl["id"].map(visitas.groupby("cliente_id")["id"].count()).fillna(0).astype(int)
-    cl["gastado"] = cl["id"].map(completados.groupby("cliente_id")["total"].sum()).fillna(0.0)
-    cl["ultima_visita"] = pd.to_datetime(cl["id"].map(visitas.groupby("cliente_id")["inicio"].max()))
-    cl["proximo_turno"] = pd.to_datetime(cl["id"].map(futuros.groupby("cliente_id")["inicio"].min()))
-    cl["ultimo_servicio"] = cl["id"].map(visitas.sort_values("inicio").groupby("cliente_id")["servicios"].last())
+    cl["visitas"] = por_cliente(visitas.groupby("cliente_id")["id"].count()).fillna(0).astype(int)
+    cl["gastado"] = por_cliente(completados.groupby("cliente_id")["total"].sum()).fillna(0.0).astype(float)
+    cl["ultima_visita"] = pd.to_datetime(por_cliente(visitas.groupby("cliente_id")["inicio"].max()))
+    cl["proximo_turno"] = pd.to_datetime(por_cliente(futuros.groupby("cliente_id")["inicio"].min()))
+    cl["ultimo_servicio"] = por_cliente(visitas.sort_values("inicio").groupby("cliente_id")["servicios"].last())
     cl["dias_sin_venir"] = (now - cl["ultima_visita"]).dt.days
     cl["fecha_nacimiento"] = pd.to_datetime(cl["fecha_nacimiento"], errors="coerce")
     cl["creado_en"] = pd.to_datetime(cl["creado_en"], errors="coerce")
@@ -747,8 +752,9 @@ def ficha_cliente(c, turnos):
         c1, c2 = st.columns(2)
         nombre = c1.text_input("Nombre *", c["nombre"])
         apellido = c2.text_input("Apellido *", c["apellido"])
-        telefono = c1.text_input("WhatsApp *", c["telefono"] or "")
-        email = c2.text_input("Email", c["email"] or "")
+        telefono = c1.text_input("WhatsApp", c["telefono"] if isinstance(c["telefono"], str) else "")
+        email = c2.text_input("Email", c["email"] if isinstance(c["email"], str) else "")
+        domicilio = st.text_input("Domicilio", c["domicilio"] if isinstance(c["domicilio"], str) else "")
         nacimiento = c1.date_input(
             "Fecha de nacimiento", c["fecha_nacimiento"].date() if pd.notna(c["fecha_nacimiento"]) else None,
             min_value=date(1920, 1, 1), max_value=ahora().date(), format="DD/MM/YYYY")
@@ -759,14 +765,15 @@ def ficha_cliente(c, turnos):
                               index=ORIGENES.index(origen_actual) if origen_actual else None, placeholder="—")
         acepta = c2.checkbox("Acepta recibir promociones por WhatsApp", bool(c["acepta_mensajes"]))
         if st.form_submit_button("💾 Guardar datos", type="primary"):
-            if not (nombre.strip() and apellido.strip() and telefono.strip()):
-                st.error("Nombre, apellido y WhatsApp son obligatorios.")
+            if not (nombre.strip() and apellido.strip()):
+                st.error("Nombre y apellido son obligatorios.")
             else:
                 db.execute(
-                    """UPDATE clientes SET nombre=%s, apellido=%s, telefono=%s, email=%s, fecha_nacimiento=%s,
-                                           edad=%s, origen=%s, acepta_mensajes=%s WHERE id=%s""",
-                    (nombre.strip(), apellido.strip(), telefono.strip(), email.strip() or None, nacimiento,
-                     edad_in or None, origen, acepta, int(c["id"])),
+                    """UPDATE clientes SET nombre=%s, apellido=%s, telefono=%s, email=%s, domicilio=%s,
+                                           fecha_nacimiento=%s, edad=%s, origen=%s, acepta_mensajes=%s
+                       WHERE id=%s""",
+                    (nombre.strip(), apellido.strip(), telefono.strip() or None, email.strip() or None,
+                     domicilio.strip() or None, nacimiento, edad_in or None, origen, acepta, int(c["id"])),
                 )
                 invalidar()
                 flash("Datos del cliente actualizados")
@@ -813,6 +820,7 @@ def pagina_clientes():
             nacimiento = c2.date_input("Fecha de nacimiento", None, min_value=date(1920, 1, 1),
                                        max_value=ahora().date(), format="DD/MM/YYYY")
             origen = c3.selectbox("¿Cómo nos conoció?", ORIGENES, index=None, placeholder="—")
+            domicilio = st.text_input("Domicilio")
             acepta = st.checkbox("Acepta recibir promociones por WhatsApp", True)
             if st.form_submit_button("Registrar", type="primary"):
                 tel = telefono_wa(telefono)
@@ -823,11 +831,11 @@ def pagina_clientes():
                     st.error(f"Ya existe un cliente con ese teléfono: {repetido.iloc[0]['cliente']}.")
                 else:
                     nuevo = db.execute(
-                        """INSERT INTO clientes (nombre, apellido, telefono, email, fecha_nacimiento, origen,
-                                                 acepta_mensajes)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                        (nombre.strip(), apellido.strip(), telefono.strip(), email.strip() or None, nacimiento,
-                         origen, acepta),
+                        """INSERT INTO clientes (nombre, apellido, telefono, email, domicilio, fecha_nacimiento,
+                                                 origen, acepta_mensajes)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                        (nombre.strip(), apellido.strip(), telefono.strip(), email.strip() or None,
+                         domicilio.strip() or None, nacimiento, origen, acepta),
                     )
                     invalidar()
                     flash(f"Cliente {nombre} {apellido} registrado")
