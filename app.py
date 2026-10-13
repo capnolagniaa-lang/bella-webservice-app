@@ -1,6 +1,9 @@
 import functools
+import hashlib
+import hmac
 import inspect
 import re
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -35,6 +38,7 @@ MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto
 CONFIG_DEFAULT = {
     "negocio": "Bella",
     "link_resena": "",
+    "clave_hash": "",
     "tpl_recordatorio": (
         "¡Hola {nombre}! 💖 Te recordamos tu turno en {negocio} el {fecha} a las {hora} hs "
         "para {servicios}. ¿Nos confirmás? Si no podés venir avisanos así lo reprogramamos 🙌"
@@ -170,6 +174,20 @@ def datos_turno_msg(t):
                 servicios=servicios if isinstance(servicios, str) and servicios else "tu tratamiento")
 
 
+def hash_clave(clave, sal=None):
+    sal = sal or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", clave.encode(), bytes.fromhex(sal), 200_000).hex()
+    return f"{sal}${digest}"
+
+
+def clave_valida(clave, guardado):
+    try:
+        sal, _ = guardado.split("$", 1)
+    except ValueError:
+        return False
+    return hmac.compare_digest(hash_clave(clave, sal), guardado)
+
+
 def flash(texto, icono="✅"):
     ss.setdefault("flash", []).append((texto, icono))
 
@@ -294,24 +312,39 @@ def superposiciones(inicio, fin, excluir_id=None):
 
 # --------------------------------------------------------------------------- escrituras
 
-def _anotar_historia(cur, cliente_id, inicio, servicios):
+def _anotar_historia(cur, turno_id, cliente_id, inicio, servicios, profesional=None):
+    """Entrada automática en la historia clínica (una sola por turno)."""
     cur.execute(
-        """INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s)
-           ON CONFLICT (cliente_id) DO UPDATE
-           SET notas = COALESCE(NULLIF(historias_clinicas.notas, '') || E'\\n', '') || EXCLUDED.notas""",
-        (cliente_id, f"[{naive(inicio):%d/%m/%Y %H:%M}] {servicios or 'Turno'}"),
+        """INSERT INTO historia_entradas (cliente_id, fecha, tipo, texto, autor, turno_id)
+           VALUES (%s, %s, 'turno', %s, %s, %s) ON CONFLICT (turno_id) DO NOTHING""",
+        (cliente_id, naive(inicio), f"Turno realizado: {servicios or 'sin detalle'}", profesional or None, turno_id),
     )
 
 
 def cambiar_estado(ids, estado):
     """Cambia el estado; al completar un turno se deja registro en la historia clínica."""
     with db.transaction() as cur:
-        cur.execute("SELECT id, cliente_id, fecha_inicio, servicios, estado FROM turnos WHERE id = ANY(%s)",
-                    (list(ids),))
+        cur.execute("""SELECT id, cliente_id, fecha_inicio, servicios, profesional, estado
+                       FROM turnos WHERE id = ANY(%s)""", (list(ids),))
         for t in cur.fetchall():
             if estado == "completado" and t["estado"] != "completado":
-                _anotar_historia(cur, t["cliente_id"], t["fecha_inicio"], t["servicios"])
+                _anotar_historia(cur, t["id"], t["cliente_id"], t["fecha_inicio"], t["servicios"], t["profesional"])
         cur.execute("UPDATE turnos SET estado = %s WHERE id = ANY(%s)", (estado, list(ids)))
+
+
+def alerta_antecedentes(cliente_id):
+    """Muestra alergias, medicación y contraindicaciones antes de atender o agendar."""
+    hc = db.fetch_one(
+        "SELECT alergias, medicacion, contraindicaciones FROM historias_clinicas WHERE cliente_id = %s",
+        (int(cliente_id),),
+    )
+    if not hc:
+        return
+    partes = [f"**{titulo}:** {hc[campo]}" for campo, titulo in
+              (("alergias", "Alergias"), ("medicacion", "Medicación"), ("contraindicaciones", "Contraindicaciones"))
+              if (hc[campo] or "").strip()]
+    if partes:
+        st.warning("⚕️ " + "  \n".join(partes))
 
 
 def guardar_config(valores):
@@ -342,6 +375,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
             format_func=lambda i: f"{clientes[i]['nombre']} {clientes[i]['apellido']} · {clientes[i]['telefono'] or 's/tel'}",
             placeholder="Buscá por nombre, apellido o teléfono…",
         )
+        if cli_id:
+            alerta_antecedentes(cli_id)
         nuevo = None
     else:
         cli_id = None
@@ -434,6 +469,7 @@ def dialogo_turno(turno_id):
     st.markdown(f"### {t['nombre']} {t['apellido']} {chip(t['estado'])}", unsafe_allow_html=True)
     st.markdown(f"**{fecha_larga(ini).capitalize()}**, {ini:%H:%M} a {fin:%H:%M} hs · {t['servicios'] or 'Turno'}"
                 f" · {money(t['total'])}" + (f" · con {t['profesional']}" if t["profesional"] else ""))
+    alerta_antecedentes(t["cliente_id"])
 
     c1, c2, c3 = st.columns(3)
     url = link_wa(t["telefono"], mensaje("tpl_recordatorio", **datos_turno_msg(t)))
@@ -470,7 +506,7 @@ def dialogo_turno(turno_id):
             nuevo_fin = nuevo_ini + timedelta(minutes=int(minutos))
             with db.transaction() as cur:
                 if estado == "completado" and t["estado"] != "completado":
-                    _anotar_historia(cur, t["cliente_id"], nuevo_ini, servicios)
+                    _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, profesional)
                 cur.execute(
                     """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, profesional=%s,
                                          servicios=%s, notas=%s WHERE id=%s""",
@@ -726,6 +762,87 @@ def pagina_agenda():
         st.rerun()
 
 
+def historia_clinica(cliente_id, nombre_cliente):
+    hc = db.fetch_one(
+        """SELECT alergias, medicacion, contraindicaciones, antecedentes, consentimiento_fecha, actualizado_en
+           FROM historias_clinicas WHERE cliente_id = %s""", (cliente_id,)) or {}
+    alerta_antecedentes(cliente_id)
+
+    with st.expander("⚕️ Antecedentes", expanded=not any(hc.get(k) for k in ("alergias", "medicacion",
+                                                                            "contraindicaciones", "antecedentes"))):
+        with st.form(f"antecedentes_{cliente_id}"):
+            c1, c2 = st.columns(2)
+            alergias = c1.text_area("Alergias", hc.get("alergias") or "", height=80,
+                                    placeholder="Ej.: látex, lidocaína, ácido salicílico")
+            medicacion = c2.text_area("Medicación actual", hc.get("medicacion") or "", height=80,
+                                      placeholder="Ej.: anticoagulantes, isotretinoína")
+            contra = c1.text_area("Contraindicaciones", hc.get("contraindicaciones") or "", height=80,
+                                  placeholder="Ej.: embarazo, marcapasos, implantes metálicos")
+            otros = c2.text_area("Otros antecedentes", hc.get("antecedentes") or "", height=80,
+                                 placeholder="Tipo de piel, cirugías, tratamientos previos…")
+            consentimiento = st.date_input("Consentimiento informado firmado el", hc.get("consentimiento_fecha"),
+                                           format="DD/MM/YYYY", max_value=ahora().date())
+            if hc.get("actualizado_en"):
+                st.caption(f"Última actualización: {naive(hc['actualizado_en']):%d/%m/%Y %H:%M}")
+            if st.form_submit_button("💾 Guardar antecedentes", type="primary"):
+                db.execute(
+                    """INSERT INTO historias_clinicas (cliente_id, alergias, medicacion, contraindicaciones,
+                                                      antecedentes, consentimiento_fecha, actualizado_en)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (cliente_id) DO UPDATE SET
+                           alergias = EXCLUDED.alergias, medicacion = EXCLUDED.medicacion,
+                           contraindicaciones = EXCLUDED.contraindicaciones, antecedentes = EXCLUDED.antecedentes,
+                           consentimiento_fecha = EXCLUDED.consentimiento_fecha,
+                           actualizado_en = EXCLUDED.actualizado_en""",
+                    (cliente_id, alergias.strip() or None, medicacion.strip() or None, contra.strip() or None,
+                     otros.strip() or None, consentimiento, ahora()),
+                )
+                flash("Antecedentes guardados")
+                st.rerun()
+
+    with st.form(f"entrada_{cliente_id}", clear_on_submit=True):
+        st.markdown("**Nueva entrada**")
+        texto = st.text_area("Evolución / observaciones", height=110, label_visibility="collapsed",
+                             placeholder="Qué se hizo, productos y parámetros usados, cómo respondió la piel, "
+                                         "indicaciones para la casa…")
+        c1, c2 = st.columns([2, 1])
+        autor = c1.text_input("Profesional", ss.get("autor", ""), placeholder="Quién escribe la nota")
+        fecha = c2.date_input("Fecha", ahora().date(), format="DD/MM/YYYY", max_value=ahora().date())
+        if st.form_submit_button("➕ Agregar a la historia", type="primary"):
+            if not texto.strip():
+                st.error("Escribí el contenido de la entrada.")
+            else:
+                ss.autor = autor.strip()
+                momento = ahora() if fecha == ahora().date() else datetime.combine(fecha, datetime.min.time())
+                db.execute("INSERT INTO historia_entradas (cliente_id, fecha, tipo, texto, autor) "
+                           "VALUES (%s, %s, 'nota', %s, %s)", (cliente_id, momento, texto.strip(), autor.strip() or None))
+                flash("Entrada agregada a la historia clínica")
+                st.rerun()
+
+    entradas = db.fetch("SELECT id, fecha, tipo, texto, autor FROM historia_entradas "
+                        "WHERE cliente_id = %s ORDER BY fecha DESC, id DESC", (cliente_id,))
+    if not entradas:
+        st.caption("Todavía no hay entradas. Al completar un turno se registra automáticamente.")
+        return
+    exportado = "\n\n".join(
+        f"[{naive(e['fecha']):%d/%m/%Y %H:%M}] {e['autor'] or ''}\n{e['texto']}" for e in reversed(entradas))
+    st.download_button("⬇️ Descargar historia (.txt)", f"Historia clínica — {nombre_cliente}\n\n{exportado}",
+                       file_name=f"historia_{nombre_cliente.replace(' ', '_')}.txt")
+    for e in entradas:
+        with st.container(border=True):
+            c1, c2 = st.columns([10, 1])
+            icono = "💆" if e["tipo"] == "turno" else "📝"
+            c1.markdown(f"{icono} **{naive(e['fecha']):%d/%m/%Y %H:%M}**"
+                        + (f" · <span class='muted'>{e['autor']}</span>" if e["autor"] else ""),
+                        unsafe_allow_html=True)
+            with c2.popover("⋯"):
+                if st.button("🗑️ Borrar entrada", key=f"borrar_entrada_{e['id']}"):
+                    db.execute("DELETE FROM historia_entradas WHERE id = %s", (e["id"],))
+                    flash("Entrada borrada", "🗑️")
+                    st.rerun()
+            st.markdown(e["texto"])
+
+
 def ficha_cliente(c, turnos):
     st.button("← Volver al listado", on_click=lambda: ss.update(cliente_sel=None))
     edad = c["edad"]
@@ -780,18 +897,7 @@ def ficha_cliente(c, turnos):
                 st.rerun()
 
     with tab_hc:
-        hc = db.fetch_one("SELECT notas FROM historias_clinicas WHERE cliente_id = %s", (int(c["id"]),))
-        with st.form(f"hc_{c['id']}"):
-            notas = st.text_area("Historia clínica", hc["notas"] if hc else "", height=280,
-                                 help="Al completar un turno se agrega automáticamente una línea con la fecha y el servicio.")
-            if st.form_submit_button("💾 Guardar historia clínica", type="primary"):
-                db.execute(
-                    """INSERT INTO historias_clinicas (cliente_id, notas) VALUES (%s, %s)
-                       ON CONFLICT (cliente_id) DO UPDATE SET notas = EXCLUDED.notas""",
-                    (int(c["id"]), notas),
-                )
-                flash("Historia clínica guardada")
-                st.rerun()
+        historia_clinica(int(c["id"]), f"{c['nombre']} {c['apellido']}")
 
     with tab_turnos:
         propios = turnos[turnos["cliente_id"] == c["id"]].sort_values("inicio", ascending=False)
@@ -1011,6 +1117,163 @@ def pagina_marketing():
                 st.rerun()
 
 
+def pendientes():
+    """Checklist calculada con los datos reales: (hecho, título, detalle)."""
+    cfg = q_config()
+    trats = [t for t in q_tratamientos() if t["activo"]]
+    clientes = q_clientes()
+    sin_precio = [t["nombre"] for t in trats if not t["precio"]]
+    todos_60 = bool(trats) and all(t["duracion_min"] == 60 for t in trats)
+    sin_origen = sum(1 for c in clientes if not c["origen"])
+    sin_tel = sum(1 for c in clientes if not c["telefono"])
+    return [
+        (bool(cfg["clave_hash"]), "Poner contraseña a la app",
+         "Hoy cualquiera con el link ve clientes e historias clínicas. Configurala más abajo en esta página."),
+        (False, "Proteger la base de datos",
+         "El repositorio de GitHub es público y tiene la contraseña de la base en `db.py`. Pasalo a privado "
+         "(GitHub → Settings → Change visibility) o mové la URL a un *secret* y cambiá la contraseña en Render."),
+        (False, "Plan pago y backups en Render",
+         "Las bases gratuitas de Render vencen a los 30 días y no tienen copias de seguridad. Con un plan pago "
+         "(desde USD 7/mes) la base no vence y tiene backups diarios."),
+        (False, "Cerrar el acceso a Firebase",
+         "La base vieja de Firebase se puede leer sin contraseña. Ya está migrada: borrá los datos o cerrá las "
+         "reglas de Firestore."),
+        (not sin_precio, "Completar precios",
+         f"Tratamientos sin precio: {', '.join(sin_precio)}." if sin_precio else "Todos tienen precio."),
+        (not todos_60, "Ajustar duraciones de los tratamientos",
+         "Todos duran 60 min (valor por defecto). Con la duración real, la agenda calcula bien el fin de cada turno."),
+        (bool(cfg["link_resena"]), "Cargar el link de reseñas de Google",
+         "Marketing → ⚙️ Plantillas. Se usa en el mensaje que se manda después de cada turno completado."),
+        (sin_origen == 0, "Registrar cómo te conoció cada cliente",
+         f"{sin_origen} clientes sin dato. Con eso sabés qué canal de publicidad te trae más facturación."),
+        (sin_tel == 0, "Completar teléfonos", f"{sin_tel} clientes sin WhatsApp: no pueden recibir recordatorios."),
+    ]
+
+
+def pagina_instrucciones():
+    st.title("📖 Instrucciones")
+    st.caption("Cómo funciona la aplicación, qué información guarda y qué conviene hacer a continuación.")
+
+    tab_uso, tab_datos, tab_pasos, tab_seg = st.tabs(
+        ["🧭 Cómo se usa", "🗄️ Qué se guarda", "🚀 Próximos pasos", "🔒 Contraseña"])
+
+    with tab_uso:
+        st.markdown("""
+### Rutina diaria recomendada
+1. **Al abrir el día — 🏠 Inicio.** Mirá la agenda de hoy y mandá los **recordatorios para mañana** (botón 💬).
+   Cuando el cliente confirme, tocá 👍 para marcarlo como *Confirmado*.
+2. **Durante el día — 📅 Agenda.** Para agendar, **arrastrá sobre un horario libre** (o usá *➕ Nuevo turno*).
+   Para reprogramar, **arrastrá el turno** a otro horario o estiralo para cambiar la duración.
+   Haciendo **clic en un turno** ves el detalle, las alergias del cliente y podés editarlo.
+3. **Después de atender** abrí el turno y tocá **✅ Marcar completado**. Eso:
+   - suma el importe a la facturación,
+   - agrega una entrada automática en la **historia clínica**,
+   - habilita el mensaje de **pedido de reseña**.
+4. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
+   los turnos que hayan quedado abiertos, así los números son reales.
+
+### Estados de un turno
+| Estado | Significado |
+|---|---|
+| 🔵 Reservado | Agendado, sin confirmar |
+| 🟢 Confirmado | El cliente confirmó que viene |
+| 🟣 Completado | Atendido: cuenta para facturación e historia clínica |
+| 🔴 Ausente | No vino ni avisó: cuenta para el % de ausentismo |
+| ⚪ Cancelado | Avisó que no viene (se oculta del calendario) |
+
+### Secciones
+- **👥 Clientes:** buscador, ficha con datos de contacto, visitas, gasto total, **historia clínica** y turnos.
+- **💄 Tratamientos:** precios y duraciones. Para dejar de ofrecer uno, desmarcá *Activo* (no se borra el historial).
+- **📣 Marketing:** listas listas para escribir por WhatsApp (clientes que no vuelven, cumpleaños, una sola visita,
+  mejores clientes) con mensajes personalizados que editás en *⚙️ Plantillas*. En *📈 Canales* ves qué medio
+  (Instagram, recomendación, etc.) trae clientes que más gastan.
+
+### Historia clínica
+- **Antecedentes:** alergias, medicación, contraindicaciones, otros datos y fecha del consentimiento informado.
+  Las alergias, la medicación y las contraindicaciones aparecen como **alerta amarilla** al agendar y al abrir un turno.
+- **Entradas:** cada nota es un registro aparte con fecha y profesional. **No se pisan entre sí.**
+  Cada turno completado agrega una entrada automática (💆); las notas escritas a mano llevan 📝.
+- Se puede **descargar** la historia completa en un archivo de texto para imprimirla o enviarla.
+""")
+
+    with tab_datos:
+        st.markdown("""
+Todo se guarda en una base de datos **PostgreSQL en Render** (Virginia, EE. UU.). La aplicación no guarda nada
+en el navegador ni en otros servicios.
+
+| Dato | Qué incluye |
+|---|---|
+| **Clientes** | Nombre, apellido, WhatsApp, email, domicilio, edad o fecha de nacimiento, cómo te conoció, si acepta promociones y fecha de alta |
+| **Historia clínica** | Antecedentes (alergias, medicación, contraindicaciones, otros, consentimiento) y entradas fechadas con autor |
+| **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio final y notas |
+| **Tratamientos** | Nombre, precio, duración, descripción y si está activo |
+| **Configuración** | Nombre del negocio, link de reseñas, plantillas de mensajes y contraseña (cifrada) |
+
+**Qué *no* se guarda:** pagos o señas, fotos de antes/después y mensajes de WhatsApp (los mensajes se abren
+en tu WhatsApp y se envían desde ahí).
+
+**Datos de origen:** los clientes y tratamientos se migraron de Firebase en octubre de 2026
+(77 clientes, unificando 3 cargados dos veces, y 118 tratamientos). Los turnos de Firebase no se migraron.
+
+**Datos sensibles:** la historia clínica es información de salud. En Argentina la Ley 25.326 de protección de
+datos personales exige protegerla y usarla solo para la atención. Por eso conviene completar los pasos de
+seguridad de la pestaña *🚀 Próximos pasos*.
+""")
+
+    with tab_pasos:
+        items = pendientes()
+        hechos = sum(1 for h, _, _ in items if h)
+        st.progress(hechos / len(items), text=f"{hechos} de {len(items)} completados")
+        for hecho, titulo, detalle in items:
+            st.markdown(f"{'✅' if hecho else '⬜'} **{titulo}**  \n<span class='muted'>{detalle}</span>",
+                        unsafe_allow_html=True)
+        st.divider()
+        st.markdown("""
+### Mejoras que se pueden sumar
+- **Recordatorios automáticos** por WhatsApp Business API, sin tener que tocar el botón.
+- **Seña con Mercado Pago** al reservar, para bajar el ausentismo.
+- **Reserva online** para que los clientes elijan horario solos desde Instagram.
+- **Agenda por profesional o por cabina**, si atienden varias personas a la vez.
+- **Fotos de antes y después** dentro de la historia clínica.
+- **Usuarios individuales** para saber quién hizo cada cambio.
+""")
+
+    with tab_seg:
+        cfg = q_config()
+        tiene_clave = bool(cfg["clave_hash"])
+        if tiene_clave:
+            st.success("La app está protegida con contraseña.")
+        else:
+            st.warning("La app **no tiene contraseña**: cualquiera con el link puede ver y modificar los datos.")
+        with st.form("clave_acceso", clear_on_submit=True):
+            actual = st.text_input("Contraseña actual", type="password") if tiene_clave else ""
+            nueva = st.text_input("Nueva contraseña", type="password", help="Mínimo 8 caracteres.")
+            repetir = st.text_input("Repetir nueva contraseña", type="password")
+            c1, c2 = st.columns(2)
+            guardar = c1.form_submit_button("💾 Guardar contraseña", type="primary", width="stretch")
+            quitar = c2.form_submit_button("Quitar contraseña", width="stretch", disabled=not tiene_clave)
+            if guardar or quitar:
+                if tiene_clave and not clave_valida(actual, cfg["clave_hash"]):
+                    st.error("La contraseña actual no es correcta.")
+                elif quitar:
+                    guardar_config({"clave_hash": ""})
+                    st.cache_data.clear()
+                    flash("Contraseña quitada", "🔓")
+                    st.rerun()
+                elif len(nueva) < 8:
+                    st.error("La nueva contraseña debe tener al menos 8 caracteres.")
+                elif nueva != repetir:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    guardar_config({"clave_hash": hash_clave(nueva)})
+                    st.cache_data.clear()
+                    ss.autenticado = True
+                    flash("Contraseña guardada", "🔒")
+                    st.rerun()
+        st.caption("La contraseña se guarda cifrada. Si la olvidás, se puede borrar desde la base de datos "
+                   "(tabla `configuracion`, clave `clave_hash`).")
+
+
 # --------------------------------------------------------------------------- arranque
 
 PAGINAS = {
@@ -1019,6 +1282,7 @@ PAGINAS = {
     "👥 Clientes": pagina_clientes,
     "💄 Tratamientos": pagina_tratamientos,
     "📣 Marketing": pagina_marketing,
+    "📖 Instrucciones": pagina_instrucciones,
 }
 
 try:
@@ -1048,12 +1312,25 @@ for texto, icono in ss.pop("flash", []):
     st.toast(texto, icon=icono)
 
 try:
-    negocio = q_config()["negocio"]
+    config = q_config()
 except db.DBError:
-    negocio = CONFIG_DEFAULT["negocio"]
+    config = CONFIG_DEFAULT
+
+if config["clave_hash"] and not ss.get("autenticado"):
+    _, centro, _ = st.columns([1, 1.2, 1])
+    with centro:
+        st.title(f"✨ {config['negocio']}")
+        with st.form("login"):
+            clave = st.text_input("Contraseña", type="password")
+            if st.form_submit_button("Ingresar", type="primary", width="stretch"):
+                if clave_valida(clave, config["clave_hash"]):
+                    ss.autenticado = True
+                    st.rerun()
+                st.error("Contraseña incorrecta.")
+    st.stop()
 
 with st.sidebar:
-    st.markdown(f"## ✨ {negocio}")
+    st.markdown(f"## ✨ {config['negocio']}")
     pagina = st.radio("Menú", list(PAGINAS), key="pagina", label_visibility="collapsed")
     st.write("")
     if st.button("➕ Nuevo turno", type="primary", width="stretch", key="nuevo_turno_sidebar"):
@@ -1061,6 +1338,12 @@ with st.sidebar:
     if st.button("🔄 Actualizar datos", width="stretch"):
         invalidar()
         st.rerun()
+    if config["clave_hash"]:
+        if st.button("🚪 Cerrar sesión", width="stretch"):
+            ss.autenticado = False
+            st.rerun()
+    else:
+        st.caption("⚠️ La app no tiene contraseña. Configurala en 📖 Instrucciones → 🔒 Contraseña.")
 
 try:
     PAGINAS[pagina]()

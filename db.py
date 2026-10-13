@@ -211,6 +211,27 @@ _MIGRATIONS = [
         precio NUMERIC(12,2),
         PRIMARY KEY (turno_id, tratamiento_id))""",
     "CREATE TABLE IF NOT EXISTS configuracion (clave TEXT PRIMARY KEY, valor TEXT NOT NULL)",
+    # Historia clínica: antecedentes fijos por cliente + entradas fechadas que no se pisan.
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS alergias TEXT",
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS medicacion TEXT",
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS contraindicaciones TEXT",
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS antecedentes TEXT",
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS consentimiento_fecha DATE",
+    "ALTER TABLE historias_clinicas ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMP",
+    """CREATE TABLE IF NOT EXISTS historia_entradas (
+        id SERIAL PRIMARY KEY,
+        cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+        fecha TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'America/Argentina/Buenos_Aires'),
+        tipo TEXT NOT NULL DEFAULT 'nota',
+        texto TEXT NOT NULL,
+        autor TEXT,
+        turno_id INTEGER UNIQUE REFERENCES turnos(id) ON DELETE SET NULL)""",
+    "CREATE INDEX IF NOT EXISTS historia_entradas_cliente_idx ON historia_entradas (cliente_id, fecha DESC)",
+    # El texto libre de la versión anterior pasa a ser la primera entrada de cada cliente.
+    """INSERT INTO historia_entradas (cliente_id, tipo, texto, autor)
+       SELECT cliente_id, 'nota', notas, 'Historia anterior'
+       FROM historias_clinicas WHERE COALESCE(notas, '') <> ''""",
+    "UPDATE historias_clinicas SET notas = NULL WHERE COALESCE(notas, '') <> ''",
 ]
 
 
