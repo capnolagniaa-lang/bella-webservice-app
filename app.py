@@ -30,6 +30,12 @@ ESTADOS = {
 }
 OCUPAN_AGENDA = ("reservado", "confirmado", "completado")
 PENDIENTES = ("reservado", "confirmado")
+SENA_ESTADOS = {
+    "senado": ("Señado", "#1F9D6B", "💰"),
+    "parcial": ("Seña parcial", "#E39B2D", "🟠"),
+    "sin_sena": ("Sin seña", "#D9534F", "⚠️"),
+}
+MEDIOS_PAGO = ["Transferencia", "Mercado Pago", "Efectivo", "Tarjeta"]
 ORIGENES = ["Instagram", "Facebook", "TikTok", "Google", "Recomendación", "Pasó por el local", "Otro"]
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
@@ -39,6 +45,12 @@ CONFIG_DEFAULT = {
     "negocio": "Bella",
     "link_resena": "",
     "clave_hash": "",
+    "sena_porcentaje": "50",
+    "datos_pago": "",
+    "tpl_sena": (
+        "¡Hola {nombre}! 💖 Para confirmar tu turno en {negocio} del {fecha} a las {hora} hs ({servicios}) "
+        "te pedimos una seña de {sena}. {datos_pago} Cuando la envíes, mandanos el comprobante por acá 🙌"
+    ),
     "tpl_recordatorio": (
         "¡Hola {nombre}! 💖 Te recordamos tu turno en {negocio} el {fecha} a las {hora} hs "
         "para {servicios}. ¿Nos confirmás? Si no podés venir avisanos así lo reprogramamos 🙌"
@@ -62,6 +74,7 @@ CONFIG_DEFAULT = {
 }
 PLANTILLAS = {
     "tpl_recordatorio": "Recordatorio de turno",
+    "tpl_sena": "Pedido de seña",
     "tpl_reactivacion": "Reactivación (clientes que no vuelven)",
     "tpl_cumpleanos": "Cumpleaños",
     "tpl_segunda_visita": "Segunda visita",
@@ -90,6 +103,7 @@ CALENDAR_CSS = """
 .fc .fc-button-primary:not(:disabled).fc-button-active,
 .fc .fc-button-primary:not(:disabled):active { background: #A8305C; border-color: #A8305C; }
 .fc .fc-timegrid-now-indicator-line { border-color: #D6457A; }
+.fc-event.sin-sena { border-width: 2px; border-style: dashed; }
 """
 
 
@@ -164,14 +178,57 @@ def mensaje(clave, **datos):
     cfg = q_config()
     datos.setdefault("negocio", cfg["negocio"])
     datos.setdefault("link_resena", cfg["link_resena"])
-    return cfg[clave].format_map(_SafeDict(datos)).strip()
+    datos.setdefault("datos_pago", cfg["datos_pago"])
+    return re.sub(r" {2,}", " ", cfg[clave].format_map(_SafeDict(datos))).strip()
 
 
 def datos_turno_msg(t):
     ini = naive(t["inicio"])
     servicios = t.get("servicios")
+    pendiente = sena_requerida(t.get("total")) - float(t.get("sena_monto") or 0)
     return dict(nombre=t["nombre"], fecha=fecha_larga(ini), hora=ini.strftime("%H:%M"),
-                servicios=servicios if isinstance(servicios, str) and servicios else "tu tratamiento")
+                servicios=servicios if isinstance(servicios, str) and servicios else "tu tratamiento",
+                sena=money(max(0, pendiente)))
+
+
+# --------------------------------------------------------------------------- seña
+
+def porcentaje_sena():
+    try:
+        return max(0.0, min(100.0, float(q_config()["sena_porcentaje"])))
+    except (TypeError, ValueError):
+        return 50.0
+
+
+def sena_requerida(total):
+    return round(float(total or 0) * porcentaje_sena() / 100)
+
+
+def estado_sena(total, pagado):
+    pagado = float(pagado or 0)
+    if porcentaje_sena() == 0 or (pagado > 0 and pagado >= sena_requerida(total)):
+        return "senado"
+    return "parcial" if pagado > 0 else "sin_sena"
+
+
+def chip_sena(total, pagado):
+    label, color, icono = SENA_ESTADOS[estado_sena(total, pagado)]
+    return f'<span class="chip" style="background:{color}">{icono} {label}</span>'
+
+
+def registrar_sena(turno_id, monto, medio):
+    """Suma un pago a la seña. Si con eso queda señado, un turno reservado pasa a confirmado."""
+    with db.transaction() as cur:
+        cur.execute(
+            """UPDATE turnos SET sena_monto = COALESCE(sena_monto, 0) + %s, sena_fecha = %s,
+                      sena_medio = CASE WHEN sena_medio IS NULL OR sena_medio = %s THEN %s
+                                        ELSE sena_medio || ' + ' || %s END
+               WHERE id = %s RETURNING total, sena_monto, estado""",
+            (monto, ahora(), medio, medio, medio, turno_id),
+        )
+        t = cur.fetchone()
+        if t and t["estado"] == "reservado" and estado_sena(t["total"], t["sena_monto"]) == "senado":
+            cur.execute("UPDATE turnos SET estado = 'confirmado' WHERE id = %s", (turno_id,))
 
 
 def hash_clave(clave, sal=None):
@@ -245,15 +302,16 @@ def q_tratamientos():
 
 
 TURNO_COLS = ["id", "cliente_id", "inicio", "fin", "servicios", "profesional", "estado", "notas",
-              "total", "nombre", "apellido", "telefono", "acepta_mensajes"]
+              "total", "sena_monto", "sena_fecha", "sena_medio", "nombre", "apellido", "telefono",
+              "acepta_mensajes"]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def q_turnos():
     rows = db.fetch(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
-                  t.profesional, t.estado, t.notas, t.total, c.nombre, c.apellido, c.telefono,
-                  c.acepta_mensajes
+                  t.profesional, t.estado, t.notas, t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
+                  c.nombre, c.apellido, c.telefono, c.acepta_mensajes
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id
            ORDER BY t.fecha_inicio"""
     )
@@ -261,6 +319,8 @@ def q_turnos():
         r["inicio"] = naive(r["inicio"])
         r["fin"] = naive(r["fin"]) or r["inicio"] + timedelta(hours=1)
         r["total"] = float(r["total"] or 0)
+        r["sena_monto"] = float(r["sena_monto"] or 0)
+        r["sena_fecha"] = naive(r["sena_fecha"])
     return rows
 
 
@@ -269,6 +329,9 @@ def df_turnos():
     df["inicio"] = pd.to_datetime(df["inicio"])
     df["fin"] = pd.to_datetime(df["fin"])
     df["total"] = df["total"].astype(float)
+    df["sena_monto"] = df["sena_monto"].astype(float)
+    df["sena"] = [estado_sena(total, pagado) for total, pagado in zip(df["total"], df["sena_monto"])]
+    df["falta_sena"] = df["estado"].isin(PENDIENTES) & (df["sena"] != "senado")
     df["cliente"] = df["nombre"].fillna("") + " " + df["apellido"].fillna("")
     return df
 
@@ -405,6 +468,20 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
     profesional = c3.text_input("Profesional (opcional)")
     notas = st.text_area("Notas del turno", placeholder="Ej.: trae su propio esmalte, alergia a…", height=80)
 
+    requerida = sena_requerida(total)
+    with st.container(border=True):
+        st.markdown(f"**💰 Seña ({porcentaje_sena():.0f}%): {money(requerida)}**")
+        c1, c2, c3 = st.columns([1.2, 1, 1], vertical_alignment="bottom")
+        pago_sena = c1.toggle("Ya pagó la seña")
+        monto_sena, medio_sena = 0.0, None
+        if pago_sena:
+            monto_sena = c2.number_input("Monto pagado ($)", 0.0, value=float(requerida), step=500.0)
+            medio_sena = c3.selectbox("Medio de pago", MEDIOS_PAGO)
+            if monto_sena < requerida:
+                st.caption(f"🟠 Quedará como seña parcial: faltan {money(requerida - monto_sena)}.")
+        else:
+            st.caption("⚠️ El turno quedará marcado **Sin seña** hasta que registres el pago desde el detalle del turno.")
+
     ini = datetime.combine(fecha, hora).replace(second=0)
     fin = ini + timedelta(minutes=int(minutos))
     st.caption(f"🕒 {fecha_larga(ini).capitalize()} de {ini:%H:%M} a {fin:%H:%M} hs")
@@ -430,6 +507,9 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
             st.error("Elegí al menos un tratamiento.")
             return
         servicios = ", ".join(t["nombre"] for t in elegidos)
+        con_sena = pago_sena and monto_sena > 0
+        if con_sena and estado == "reservado" and estado_sena(total, monto_sena) == "senado":
+            estado = "confirmado"
         with db.transaction() as cur:
             if nuevo is not None:
                 cur.execute("INSERT INTO clientes (nombre, apellido, telefono) VALUES (%s, %s, %s) RETURNING id",
@@ -437,9 +517,10 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
                 cli_id = cur.fetchone()["id"]
             cur.execute(
                 """INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, servicios, profesional,
-                                       estado, notas, total)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (cli_id, ini, fin, servicios, profesional or None, estado, notas or None, total),
+                                       estado, notas, total, sena_monto, sena_fecha, sena_medio)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (cli_id, ini, fin, servicios, profesional or None, estado, notas or None, total,
+                 monto_sena if con_sena else None, ahora() if con_sena else None, medio_sena if con_sena else None),
             )
             turno_id = cur.fetchone()["id"]
             for t in elegidos:
@@ -448,6 +529,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
         ss.cal_fecha = ini.date().isoformat()
         invalidar()
         flash(f"Turno agendado: {fecha_larga(ini)} {ini:%H:%M} hs")
+        if not con_sena:
+            flash(f"Recordá cobrar la seña de {money(requerida)}", "⚠️")
         st.rerun()
 
 
@@ -456,7 +539,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
 def dialogo_turno(turno_id):
     t = db.fetch_one(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
-                  t.profesional, t.estado, t.notas, t.total, c.nombre, c.apellido, c.telefono
+                  t.profesional, t.estado, t.notas, t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
+                  c.nombre, c.apellido, c.telefono
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id WHERE t.id = %s""",
         (turno_id,),
     )
@@ -466,10 +550,12 @@ def dialogo_turno(turno_id):
     ini = naive(t["inicio"])
     fin = naive(t["fin"]) or ini + timedelta(hours=1)
 
-    st.markdown(f"### {t['nombre']} {t['apellido']} {chip(t['estado'])}", unsafe_allow_html=True)
+    st.markdown(f"### {t['nombre']} {t['apellido']} {chip(t['estado'])} {chip_sena(t['total'], t['sena_monto'])}",
+                unsafe_allow_html=True)
     st.markdown(f"**{fecha_larga(ini).capitalize()}**, {ini:%H:%M} a {fin:%H:%M} hs · {t['servicios'] or 'Turno'}"
                 f" · {money(t['total'])}" + (f" · con {t['profesional']}" if t["profesional"] else ""))
     alerta_antecedentes(t["cliente_id"])
+    seccion_sena(t)
 
     c1, c2, c3 = st.columns(3)
     url = link_wa(t["telefono"], mensaje("tpl_recordatorio", **datos_turno_msg(t)))
@@ -531,6 +617,52 @@ def dialogo_turno(turno_id):
             st.rerun()
 
 
+def seccion_sena(t):
+    turno_id = t["id"]
+    total = float(t["total"] or 0)
+    pagado = float(t["sena_monto"] or 0)
+    requerida = sena_requerida(total)
+    estado = estado_sena(total, pagado)
+    with st.container(border=True):
+        if estado == "senado":
+            detalle = f" por {t['sena_medio']}" if t["sena_medio"] else ""
+            fecha = f" el {naive(t['sena_fecha']):%d/%m/%Y %H:%M}" if t["sena_fecha"] else ""
+            st.success(f"💰 **Señado:** {money(pagado)}{detalle}{fecha}. "
+                       f"Resta abonar {money(max(0, total - pagado))} el día del turno.")
+        elif estado == "parcial":
+            st.warning(f"🟠 **Seña parcial:** pagó {money(pagado)} de {money(requerida)}. "
+                       f"Faltan {money(requerida - pagado)}.")
+        else:
+            st.error(f"⚠️ **Sin seña.** Corresponde {money(requerida)} ({porcentaje_sena():.0f}% de {money(total)}).")
+
+        if estado != "senado":
+            with st.form(f"sena_{turno_id}", border=False):
+                c1, c2, c3 = st.columns([1, 1, 1.2], vertical_alignment="bottom")
+                monto = c1.number_input("Monto recibido ($)", 0.0, value=float(max(0, requerida - pagado)), step=500.0)
+                medio = c2.selectbox("Medio de pago", MEDIOS_PAGO)
+                if c3.form_submit_button("💰 Registrar seña", type="primary", width="stretch"):
+                    if monto <= 0:
+                        st.error("Ingresá el monto recibido.")
+                    else:
+                        registrar_sena(turno_id, monto, medio)
+                        invalidar()
+                        flash(f"Seña de {money(monto)} registrada")
+                        st.rerun()
+            url = link_wa(t["telefono"], mensaje("tpl_sena", **datos_turno_msg(t)))
+            if url:
+                st.link_button("💬 Pedir la seña por WhatsApp", url)
+        if pagado > 0:
+            with st.popover("Anular seña"):
+                st.caption("Usalo solo si se cargó por error. Si el cliente canceló, la seña queda registrada "
+                           "en el turno cancelado.")
+                if st.button("Sí, anular la seña", key=f"anular_sena_{turno_id}"):
+                    db.execute("UPDATE turnos SET sena_monto = NULL, sena_fecha = NULL, sena_medio = NULL "
+                               "WHERE id = %s", (turno_id,))
+                    invalidar()
+                    flash("Seña anulada", "↩️")
+                    st.rerun()
+
+
 def mostrar_dialogo_pendiente():
     tipo, kwargs = ss.pop("dialogo", (None, None))
     if tipo == "nuevo":
@@ -541,12 +673,13 @@ def mostrar_dialogo_pendiente():
 
 # --------------------------------------------------------------------------- páginas
 
-def fila_turno(t, prefijo, acciones=True, plantilla="tpl_recordatorio"):
+def fila_turno(t, prefijo, acciones=True, plantilla="tpl_recordatorio", con_fecha=False):
     c1, c2, c3, c4 = st.columns([1.1, 3, 1.6, 2.4], vertical_alignment="center")
-    c1.markdown(f"**{t['inicio']:%H:%M}**")
+    c1.markdown(f"**{t['inicio']:%d/%m}**  \n{t['inicio']:%H:%M}" if con_fecha else f"**{t['inicio']:%H:%M}**")
     c2.markdown(f"{t['cliente']}  \n<span class='muted'>{t['servicios'] or 'Turno'} · {money(t['total'])}</span>",
                 unsafe_allow_html=True)
-    c3.markdown(chip(t["estado"]), unsafe_allow_html=True)
+    c3.markdown(chip(t["estado"]) + (f"<br>{chip_sena(t['total'], t['sena_monto'])}"
+                                      if t["estado"] in PENDIENTES else ""), unsafe_allow_html=True)
     b1, b2, b3 = c4.columns(3)
     url = link_wa(t["telefono"], mensaje(plantilla, **datos_turno_msg(t)))
     if url:
@@ -582,15 +715,27 @@ def pagina_inicio():
     cerrados = ult90[ult90["estado"].isin(["completado", "ausente"])]
     ausentismo = (cerrados["estado"] == "ausente").mean() * 100 if len(cerrados) else 0
     nuevos = (clientes["creado_en"] >= mes_ini).sum()
+    sin_sena = df[df["falta_sena"] & (df["fin"] >= pd.Timestamp(hoy))].sort_values("inicio")
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Turnos hoy", len(de_hoy))
     k2.metric("Turnos esta semana", len(de_semana))
     k3.metric("Facturado en el mes", money(facturado), f"+{money(proyectado)} agendado", delta_color="off")
-    k4.metric("Clientes nuevos (mes)", int(nuevos))
-    k5.metric("Ausentismo (90 días)", f"{ausentismo:.0f}%",
+    k4.metric("⚠️ Turnos sin seña", len(sin_sena),
+              help="Turnos próximos (reservados o confirmados) que todavía no tienen la seña completa.")
+    k5.metric("Clientes nuevos (mes)", int(nuevos))
+    k6.metric("Ausentismo (90 días)", f"{ausentismo:.0f}%",
               help="Turnos marcados como ausente sobre el total de turnos cerrados. Los recordatorios por "
-                   "WhatsApp 24 h antes son la forma más efectiva de bajarlo.")
+                   "WhatsApp 24 h antes y la seña son las formas más efectivas de bajarlo.")
+
+    if not sin_sena.empty:
+        with st.container(border=True):
+            st.subheader(f"⚠️ Turnos sin seña ({len(sin_sena)})")
+            st.caption("Pedí la seña con 💬 y, cuando la paguen, abrí el turno con 🔍 para registrarla.")
+            for _, t in sin_sena.head(15).iterrows():
+                fila_turno(t, "sena", acciones=False, plantilla="tpl_sena", con_fecha=True)
+            if len(sin_sena) > 15:
+                st.caption(f"…y {len(sin_sena) - 15} más. Los ves marcados con ⚠️ en la Agenda.")
 
     st.write("")
     izq, der = st.columns(2, gap="large")
@@ -669,20 +814,24 @@ def pagina_agenda():
     if c1.button("➕ Nuevo turno", type="primary", width="stretch"):
         abrir_dialogo("nuevo")
     ver_cancelados = c2.toggle("Ver cancelados", value=False)
-    c3.markdown(" ".join(chip(e) for e in ESTADOS), unsafe_allow_html=True)
+    c3.markdown(" ".join(chip(e) for e in ESTADOS)
+                + "<br><span class='muted'>⚠️ sin seña · 🟠 seña parcial · 💰 señado</span>", unsafe_allow_html=True)
 
     eventos = []
     for t in q_turnos():
         if t["estado"] == "cancelado" and not ver_cancelados:
             continue
         color = ESTADOS.get(t["estado"], ESTADOS["reservado"])[1]
+        sena = estado_sena(t["total"], t["sena_monto"]) if t["estado"] in PENDIENTES else None
+        icono = SENA_ESTADOS[sena][2] + " " if sena else ""
         eventos.append({
             "id": str(t["id"]),
-            "title": f"{t['nombre']} {t['apellido']} · {t['servicios'] or 'Turno'}",
+            "title": f"{icono}{t['nombre']} {t['apellido']} · {t['servicios'] or 'Turno'}",
             "start": t["inicio"].isoformat(),
             "end": t["fin"].isoformat(),
             "backgroundColor": color,
-            "borderColor": color,
+            "borderColor": SENA_ESTADOS["sin_sena"][1] if sena and sena != "senado" else color,
+            "classNames": ["sin-sena"] if sena and sena != "senado" else [],
             "textColor": "#ffffff",
         })
 
@@ -904,12 +1053,15 @@ def ficha_cliente(c, turnos):
         if propios.empty:
             st.caption("Todavía no tiene turnos.")
         else:
-            vista = propios[["inicio", "servicios", "estado", "total"]].copy()
+            vista = propios[["inicio", "servicios", "estado", "total", "sena_monto", "sena"]].copy()
             vista["estado"] = vista["estado"].map(lambda e: ESTADOS.get(e, (e,))[0])
+            vista["sena"] = vista["sena"].map(lambda s: " ".join(SENA_ESTADOS[s][2::-2]))
             st.dataframe(vista, hide_index=True, width="stretch", column_config={
                 "inicio": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY HH:mm"),
                 "servicios": "Servicios", "estado": "Estado",
-                "total": st.column_config.NumberColumn("Total", format="$%.0f")})
+                "total": st.column_config.NumberColumn("Total", format="$%.0f"),
+                "sena_monto": st.column_config.NumberColumn("Seña pagada", format="$%.0f"),
+                "sena": "Seña"})
 
 
 def pagina_clientes():
@@ -1031,7 +1183,7 @@ def pagina_marketing():
     contactables = clientes[clientes["acepta_mensajes"].fillna(True).astype(bool) & clientes["telefono"].notna()]
     hoy = ahora()
 
-    tab_seg, tab_origen, tab_conf = st.tabs(["🎯 Segmentos", "📈 Canales", "⚙️ Plantillas"])
+    tab_seg, tab_origen, tab_conf = st.tabs(["🎯 Segmentos", "📈 Canales", "⚙️ Configuración"])
     with tab_seg:
         segmentos = {
             "💤 Para reactivar": "Vinieron alguna vez, hace tiempo que no vuelven y no tienen turno agendado.",
@@ -1108,12 +1260,22 @@ def pagina_marketing():
             negocio = c1.text_input("Nombre del negocio", cfg["negocio"])
             resena = c2.text_input("Link para dejar reseña en Google", cfg["link_resena"],
                                    placeholder="https://g.page/r/…")
-            st.caption("Variables disponibles: {nombre}, {negocio}, {fecha}, {hora}, {servicios}, {link_resena}")
+            st.markdown("**💰 Seña**")
+            c1, c2 = st.columns([1, 3])
+            porcentaje = c1.number_input("Porcentaje de seña (%)", 0, 100, int(porcentaje_sena()), step=5,
+                                         help="Se calcula sobre el precio final del turno. 0 = no se pide seña.")
+            datos_pago = c2.text_input("Datos para transferir la seña", cfg["datos_pago"],
+                                       placeholder="Alias: bella.estetica.mp · Titular: … · CBU: …",
+                                       help="Se incluye en el mensaje de WhatsApp para pedir la seña.")
+            st.markdown("**✉️ Plantillas de mensajes**")
+            st.caption("Variables disponibles: {nombre}, {negocio}, {fecha}, {hora}, {servicios}, {sena}, "
+                       "{datos_pago}, {link_resena}")
             textos = {clave: st.text_area(titulo, cfg[clave], height=90) for clave, titulo in PLANTILLAS.items()}
-            if st.form_submit_button("💾 Guardar plantillas", type="primary"):
-                guardar_config({"negocio": negocio.strip() or "Bella", "link_resena": resena.strip(), **textos})
+            if st.form_submit_button("💾 Guardar configuración", type="primary"):
+                guardar_config({"negocio": negocio.strip() or "Bella", "link_resena": resena.strip(),
+                                "sena_porcentaje": str(int(porcentaje)), "datos_pago": datos_pago.strip(), **textos})
                 st.cache_data.clear()
-                flash("Plantillas guardadas")
+                flash("Configuración guardada")
                 st.rerun()
 
 
@@ -1142,8 +1304,10 @@ def pendientes():
          f"Tratamientos sin precio: {', '.join(sin_precio)}." if sin_precio else "Todos tienen precio."),
         (not todos_60, "Ajustar duraciones de los tratamientos",
          "Todos duran 60 min (valor por defecto). Con la duración real, la agenda calcula bien el fin de cada turno."),
+        (bool(cfg["datos_pago"]), "Cargar los datos para transferir la seña",
+         "Marketing → ⚙️ Configuración. Alias o CBU que se incluye en el mensaje de WhatsApp para pedir la seña."),
         (bool(cfg["link_resena"]), "Cargar el link de reseñas de Google",
-         "Marketing → ⚙️ Plantillas. Se usa en el mensaje que se manda después de cada turno completado."),
+         "Marketing → ⚙️ Configuración. Se usa en el mensaje que se manda después de cada turno completado."),
         (sin_origen == 0, "Registrar cómo te conoció cada cliente",
          f"{sin_origen} clientes sin dato. Con eso sabés qué canal de publicidad te trae más facturación."),
         (sin_tel == 0, "Completar teléfonos", f"{sin_tel} clientes sin WhatsApp: no pueden recibir recordatorios."),
@@ -1160,16 +1324,25 @@ def pagina_instrucciones():
     with tab_uso:
         st.markdown("""
 ### Rutina diaria recomendada
-1. **Al abrir el día — 🏠 Inicio.** Mirá la agenda de hoy y mandá los **recordatorios para mañana** (botón 💬).
-   Cuando el cliente confirme, tocá 👍 para marcarlo como *Confirmado*.
+1. **Al abrir el día — 🏠 Inicio.** Mirá la agenda de hoy, los **⚠️ turnos sin seña** y mandá los
+   **recordatorios para mañana** (botón 💬). Cuando el cliente confirme, tocá 👍 para marcarlo como *Confirmado*.
 2. **Durante el día — 📅 Agenda.** Para agendar, **arrastrá sobre un horario libre** (o usá *➕ Nuevo turno*).
    Para reprogramar, **arrastrá el turno** a otro horario o estiralo para cambiar la duración.
-   Haciendo **clic en un turno** ves el detalle, las alergias del cliente y podés editarlo.
-3. **Después de atender** abrí el turno y tocá **✅ Marcar completado**. Eso:
+   Haciendo **clic en un turno** ves el detalle, la seña, las alergias del cliente y podés editarlo.
+3. **Seña.** Todos los turnos se señan con un porcentaje del precio final (50% por defecto; se cambia en
+   *📣 Marketing → ⚙️ Configuración*):
+   - Si ya la pagó al reservar, activá **"Ya pagó la seña"** en el formulario del turno.
+   - Si no, el turno queda **⚠️ Sin seña**. Pedila con **💬 Pedir la seña por WhatsApp** (el mensaje incluye el
+     monto y tus datos para transferir) y, cuando llegue el comprobante, abrí el turno y tocá **💰 Registrar seña**.
+   - Se pueden registrar pagos parciales: el turno queda **🟠 Seña parcial** hasta completar el monto.
+   - Al quedar señado, un turno *Reservado* pasa solo a **Confirmado**.
+   - En el calendario: ⚠️ sin seña (con borde rojo punteado), 🟠 parcial y 💰 señado.
+4. **Después de atender** cobrá el saldo (el detalle del turno muestra cuánto resta) y tocá
+   **✅ Marcar completado**. Eso:
    - suma el importe a la facturación,
    - agrega una entrada automática en la **historia clínica**,
    - habilita el mensaje de **pedido de reseña**.
-4. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
+5. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
    los turnos que hayan quedado abiertos, así los números son reales.
 
 ### Estados de un turno
@@ -1186,7 +1359,8 @@ def pagina_instrucciones():
 - **💄 Tratamientos:** precios y duraciones. Para dejar de ofrecer uno, desmarcá *Activo* (no se borra el historial).
 - **📣 Marketing:** listas listas para escribir por WhatsApp (clientes que no vuelven, cumpleaños, una sola visita,
   mejores clientes) con mensajes personalizados que editás en *⚙️ Plantillas*. En *📈 Canales* ves qué medio
-  (Instagram, recomendación, etc.) trae clientes que más gastan.
+  (Instagram, recomendación, etc.) trae clientes que más gastan. En *⚙️ Configuración* se cargan el
+  porcentaje de seña, los datos para transferir y los textos de los mensajes.
 
 ### Historia clínica
 - **Antecedentes:** alergias, medicación, contraindicaciones, otros datos y fecha del consentimiento informado.
@@ -1205,12 +1379,13 @@ en el navegador ni en otros servicios.
 |---|---|
 | **Clientes** | Nombre, apellido, WhatsApp, email, domicilio, edad o fecha de nacimiento, cómo te conoció, si acepta promociones y fecha de alta |
 | **Historia clínica** | Antecedentes (alergias, medicación, contraindicaciones, otros, consentimiento) y entradas fechadas con autor |
-| **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio final y notas |
+| **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio final, notas y **seña** (monto pagado, fecha y medio de pago) |
 | **Tratamientos** | Nombre, precio, duración, descripción y si está activo |
-| **Configuración** | Nombre del negocio, link de reseñas, plantillas de mensajes y contraseña (cifrada) |
+| **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
 
-**Qué *no* se guarda:** pagos o señas, fotos de antes/después y mensajes de WhatsApp (los mensajes se abren
-en tu WhatsApp y se envían desde ahí).
+**Qué *no* se guarda:** el cobro del saldo el día del turno (solo el precio final), comprobantes de pago,
+fotos de antes/después y mensajes de WhatsApp (los mensajes se abren en tu WhatsApp y se envían desde ahí).
+La app **registra** la seña, pero no la cobra: el pago se hace por fuera (transferencia, Mercado Pago, efectivo).
 
 **Datos de origen:** los clientes y tratamientos se migraron de Firebase en octubre de 2026
 (77 clientes, unificando 3 cargados dos veces, y 118 tratamientos). Los turnos de Firebase no se migraron.
@@ -1231,7 +1406,7 @@ seguridad de la pestaña *🚀 Próximos pasos*.
         st.markdown("""
 ### Mejoras que se pueden sumar
 - **Recordatorios automáticos** por WhatsApp Business API, sin tener que tocar el botón.
-- **Seña con Mercado Pago** al reservar, para bajar el ausentismo.
+- **Cobro de la seña con link de Mercado Pago**, que se marque como pagada sola al acreditarse.
 - **Reserva online** para que los clientes elijan horario solos desde Instagram.
 - **Agenda por profesional o por cabina**, si atienden varias personas a la vez.
 - **Fotos de antes y después** dentro de la historia clínica.
