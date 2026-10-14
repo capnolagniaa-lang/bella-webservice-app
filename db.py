@@ -206,6 +206,20 @@ _MIGRATIONS = [
     "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS sena_fecha TIMESTAMP",
     "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS sena_medio TEXT",
     "UPDATE turnos SET fecha_fin = fecha_inicio + INTERVAL '1 hour' WHERE fecha_fin IS NULL",
+    # Profesionales: cada turno se asigna a una; la superposición se controla por profesional.
+    """CREATE TABLE IF NOT EXISTS profesionales (
+        id SERIAL PRIMARY KEY, nombre TEXT NOT NULL, activo BOOLEAN NOT NULL DEFAULT TRUE)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS profesionales_nombre_idx ON profesionales (lower(nombre))",
+    "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS profesional_id INTEGER REFERENCES profesionales(id)",
+    # Los nombres escritos a mano en versiones anteriores pasan a ser profesionales.
+    """INSERT INTO profesionales (nombre)
+       SELECT DISTINCT ON (lower(trim(profesional))) initcap(trim(profesional))
+       FROM turnos WHERE profesional_id IS NULL AND COALESCE(trim(profesional), '') <> ''
+       ORDER BY lower(trim(profesional))
+       ON CONFLICT DO NOTHING""",
+    """UPDATE turnos t SET profesional_id = p.id FROM profesionales p
+       WHERE t.profesional_id IS NULL AND lower(trim(t.profesional)) = lower(p.nombre)""",
+    "CREATE INDEX IF NOT EXISTS turnos_profesional_idx ON turnos (profesional_id, fecha_inicio)",
     "CREATE INDEX IF NOT EXISTS turnos_fecha_inicio_idx ON turnos (fecha_inicio)",
     "CREATE INDEX IF NOT EXISTS turnos_cliente_idx ON turnos (cliente_id)",
     """CREATE TABLE IF NOT EXISTS turno_tratamientos (

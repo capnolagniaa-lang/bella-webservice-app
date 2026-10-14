@@ -301,7 +301,39 @@ def q_tratamientos():
     return rows
 
 
-TURNO_COLS = ["id", "cliente_id", "inicio", "fin", "servicios", "profesional", "estado", "notas",
+@st.cache_data(ttl=300, show_spinner=False)
+def q_profesionales():
+    return db.fetch("SELECT id, nombre, activo FROM profesionales ORDER BY nombre")
+
+
+PALETA_PROFESIONALES = ["#D6457A", "#5B7FE8", "#1F9D6B", "#E39B2D", "#8A63C9", "#2AA5B8", "#C2563A", "#6B7A8F"]
+SIN_ASIGNAR = "Sin asignar"
+
+
+def color_profesional(profesional_id):
+    ids = [p["id"] for p in q_profesionales()]
+    if profesional_id in ids:
+        return PALETA_PROFESIONALES[ids.index(profesional_id) % len(PALETA_PROFESIONALES)]
+    return "#9A9A9A"
+
+
+def nombre_profesional(profesional_id):
+    return next((p["nombre"] for p in q_profesionales() if p["id"] == profesional_id), SIN_ASIGNAR)
+
+
+def elegir_profesional(columna, etiqueta, actual=None, key=None):
+    """Selector de profesional. Devuelve (id, nombre); (None, None) si no hay profesionales cargadas."""
+    activas = [p["id"] for p in q_profesionales() if p["activo"]]
+    opciones = activas + ([actual] if actual and actual not in activas else [])
+    if not opciones:
+        columna.caption("👤 Sin profesionales cargadas (💄 Tratamientos → 👩‍⚕️ Profesionales).")
+        return None, None
+    elegido = columna.selectbox(etiqueta, opciones, index=opciones.index(actual) if actual in opciones else None,
+                                format_func=nombre_profesional, placeholder="Elegí profesional", key=key)
+    return elegido, (nombre_profesional(elegido) if elegido else None)
+
+
+TURNO_COLS = ["id", "cliente_id", "inicio", "fin", "servicios", "profesional", "profesional_id", "estado", "notas",
               "total", "sena_monto", "sena_fecha", "sena_medio", "nombre", "apellido", "telefono",
               "acepta_mensajes"]
 
@@ -310,9 +342,11 @@ TURNO_COLS = ["id", "cliente_id", "inicio", "fin", "servicios", "profesional", "
 def q_turnos():
     rows = db.fetch(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
-                  t.profesional, t.estado, t.notas, t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
+                  COALESCE(p.nombre, t.profesional) AS profesional, t.profesional_id, t.estado, t.notas,
+                  t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
                   c.nombre, c.apellido, c.telefono, c.acepta_mensajes
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id
+           LEFT JOIN profesionales p ON p.id = t.profesional_id
            ORDER BY t.fecha_inicio"""
     )
     for r in rows:
@@ -362,15 +396,31 @@ def df_clientes():
     return cl
 
 
-def superposiciones(inicio, fin, excluir_id=None):
+def turnos_en_horario(inicio, fin, excluir_id=None):
+    """Turnos activos que se pisan con el rango, de cualquier profesional."""
     return db.fetch(
-        """SELECT t.fecha_inicio, t.fecha_fin, c.nombre, c.apellido
+        """SELECT t.fecha_inicio, t.fecha_fin, t.profesional_id, c.nombre, c.apellido
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id
            WHERE t.estado IN ('reservado', 'confirmado', 'completado')
              AND t.fecha_inicio < %s AND t.fecha_fin > %s AND t.id <> %s
            ORDER BY t.fecha_inicio""",
         (fin, inicio, excluir_id or -1),
     )
+
+
+def superposiciones(inicio, fin, profesional_id, excluir_id=None):
+    """Turnos que chocan con el rango para la misma profesional (o sin asignar, si no tiene)."""
+    return [t for t in turnos_en_horario(inicio, fin, excluir_id) if t["profesional_id"] == profesional_id]
+
+
+def profesionales_libres(inicio, fin, excluir_id=None):
+    ocupadas = {t["profesional_id"] for t in turnos_en_horario(inicio, fin, excluir_id)}
+    return [p["nombre"] for p in q_profesionales() if p["activo"] and p["id"] not in ocupadas]
+
+
+def describir_choques(choques):
+    return ", ".join(f"{c['nombre']} {c['apellido']} ({naive(c['fecha_inicio']):%H:%M}–{naive(c['fecha_fin']):%H:%M})"
+                     for c in choques)
 
 
 # --------------------------------------------------------------------------- escrituras
@@ -424,8 +474,9 @@ def guardar_config(valores):
 
 @st.dialog("Nuevo turno", width="large", **DIALOGO_KW)
 @seguro
-def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
+def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional_id=None):
     inicio = inicio or proximo_horario()
+    profesional_id = profesional_id or ss.get("ultimo_profesional")
     tratamientos = [t for t in q_tratamientos() if t["activo"]]
     clientes = {c["id"]: c for c in q_clientes()}
 
@@ -465,7 +516,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
     total = c1.number_input("Precio final ($)", 0.0, value=float(precio_lista), step=500.0,
                             help="Precio de lista: suma de los tratamientos. Podés aplicar un descuento.")
     estado = c2.selectbox("Estado", list(PENDIENTES), format_func=lambda e: ESTADOS[e][0])
-    profesional = c3.text_input("Profesional (opcional)")
+    prof_id, prof_nombre = elegir_profesional(c3, "Profesional *", profesional_id)
+    hay_profesionales = any(p["activo"] for p in q_profesionales())
     notas = st.text_area("Notas del turno", placeholder="Ej.: trae su propio esmalte, alergia a…", height=80)
 
     requerida = sena_requerida(total)
@@ -489,16 +541,26 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
         st.info("La fecha elegida ya pasó: el turno quedará cargado como histórico.")
 
     forzar = True
-    choques = superposiciones(ini, fin)
-    if choques:
-        detalle = ", ".join(f"{c['nombre']} {c['apellido']} ({naive(c['fecha_inicio']):%H:%M}–{naive(c['fecha_fin']):%H:%M})"
-                            for c in choques)
-        st.warning(f"Se superpone con: {detalle}")
-        forzar = st.checkbox("Agendar igual (hay más de una profesional/camilla)")
+    if prof_id or not hay_profesionales:
+        choques = superposiciones(ini, fin, prof_id)
+        libres = profesionales_libres(ini, fin)
+        if choques:
+            quien = prof_nombre or "La agenda"
+            st.warning(f"**{quien}** ya tiene turno en ese horario: {describir_choques(choques)}."
+                       + (f"  \n✅ Libres en ese horario: **{', '.join(libres)}**." if libres else
+                          "  \nNo hay otras profesionales libres en ese horario."))
+            forzar = st.checkbox("Agendar igual (por ejemplo, atiende dos cabinas a la vez)")
+        elif hay_profesionales:
+            otros = [t for t in turnos_en_horario(ini, fin) if t["profesional_id"] != prof_id]
+            if otros:
+                st.caption(f"👥 En ese horario también hay {len(otros)} turno(s) con otras profesionales.")
 
     if st.button("Confirmar turno", type="primary", width="stretch", disabled=not forzar):
         if modo == "Existente" and not cli_id:
             st.error("Elegí un cliente.")
+            return
+        if hay_profesionales and not prof_id:
+            st.error("Elegí la profesional que atiende el turno.")
             return
         if nuevo is not None and not all(nuevo.values()):
             st.error("Completá nombre, apellido y WhatsApp del cliente nuevo.")
@@ -516,10 +578,10 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
                             (nuevo["nombre"], nuevo["apellido"], nuevo["telefono"]))
                 cli_id = cur.fetchone()["id"]
             cur.execute(
-                """INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, servicios, profesional,
+                """INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, servicios, profesional, profesional_id,
                                        estado, notas, total, sena_monto, sena_fecha, sena_medio)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (cli_id, ini, fin, servicios, profesional or None, estado, notas or None, total,
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (cli_id, ini, fin, servicios, prof_nombre, prof_id, estado, notas or None, total,
                  monto_sena if con_sena else None, ahora() if con_sena else None, medio_sena if con_sena else None),
             )
             turno_id = cur.fetchone()["id"]
@@ -527,8 +589,9 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
                 cur.execute("INSERT INTO turno_tratamientos (turno_id, tratamiento_id, precio) VALUES (%s, %s, %s)",
                             (turno_id, t["id"], t["precio"]))
         ss.cal_fecha = ini.date().isoformat()
+        ss.ultimo_profesional = prof_id
         invalidar()
-        flash(f"Turno agendado: {fecha_larga(ini)} {ini:%H:%M} hs")
+        flash(f"Turno agendado: {fecha_larga(ini)} {ini:%H:%M} hs" + (f" con {prof_nombre}" if prof_nombre else ""))
         if not con_sena:
             flash(f"Recordá cobrar la seña de {money(requerida)}", "⚠️")
         st.rerun()
@@ -539,9 +602,10 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None):
 def dialogo_turno(turno_id):
     t = db.fetch_one(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
-                  t.profesional, t.estado, t.notas, t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
-                  c.nombre, c.apellido, c.telefono
-           FROM turnos t JOIN clientes c ON c.id = t.cliente_id WHERE t.id = %s""",
+                  COALESCE(p.nombre, t.profesional) AS profesional, t.profesional_id, t.estado, t.notas,
+                  t.total, t.sena_monto, t.sena_fecha, t.sena_medio, c.nombre, c.apellido, c.telefono
+           FROM turnos t JOIN clientes c ON c.id = t.cliente_id
+           LEFT JOIN profesionales p ON p.id = t.profesional_id WHERE t.id = %s""",
         (turno_id,),
     )
     if not t:
@@ -553,7 +617,7 @@ def dialogo_turno(turno_id):
     st.markdown(f"### {t['nombre']} {t['apellido']} {chip(t['estado'])} {chip_sena(t['total'], t['sena_monto'])}",
                 unsafe_allow_html=True)
     st.markdown(f"**{fecha_larga(ini).capitalize()}**, {ini:%H:%M} a {fin:%H:%M} hs · {t['servicios'] or 'Turno'}"
-                f" · {money(t['total'])}" + (f" · con {t['profesional']}" if t["profesional"] else ""))
+                f" · {money(t['total'])} · 👤 {t['profesional'] or SIN_ASIGNAR}")
     alerta_antecedentes(t["cliente_id"])
     seccion_sena(t)
 
@@ -584,23 +648,27 @@ def dialogo_turno(turno_id):
         estado = c1.selectbox("Estado", estados, index=estados.index(t["estado"]) if t["estado"] in ESTADOS else 0,
                               format_func=lambda e: ESTADOS[e][0])
         total = c2.number_input("Precio final ($)", 0.0, value=float(t["total"] or 0), step=500.0)
-        profesional = c3.text_input("Profesional", t["profesional"] or "")
+        prof_id, prof_nombre = elegir_profesional(c3, "Profesional", t["profesional_id"],
+                                                  key=f"prof_turno_{turno_id}")
         servicios = st.text_input("Servicios", t["servicios"] or "")
         notas = st.text_area("Notas", t["notas"] or "", height=80)
         if st.form_submit_button("💾 Guardar cambios", type="primary", width="stretch"):
             nuevo_ini = datetime.combine(fecha, hora).replace(second=0)
             nuevo_fin = nuevo_ini + timedelta(minutes=int(minutos))
+            if prof_nombre is None:  # sin profesionales cargadas: se conserva el texto anterior
+                prof_nombre = t["profesional"]
             with db.transaction() as cur:
                 if estado == "completado" and t["estado"] != "completado":
-                    _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, profesional)
+                    _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, prof_nombre)
                 cur.execute(
                     """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, profesional=%s,
-                                         servicios=%s, notas=%s WHERE id=%s""",
-                    (nuevo_ini, nuevo_fin, estado, total, profesional or None, servicios, notas or None, turno_id),
+                                         profesional_id=%s, servicios=%s, notas=%s WHERE id=%s""",
+                    (nuevo_ini, nuevo_fin, estado, total, prof_nombre, prof_id, servicios, notas or None, turno_id),
                 )
-            choques = superposiciones(nuevo_ini, nuevo_fin, turno_id) if estado in OCUPAN_AGENDA else []
+            choques = superposiciones(nuevo_ini, nuevo_fin, prof_id, turno_id) if estado in OCUPAN_AGENDA else []
             if choques:
-                flash("Guardado, pero se superpone con otro turno", "⚠️")
+                flash(f"Guardado, pero {prof_nombre or 'la agenda'} ya tiene otro turno en ese horario: "
+                      f"{describir_choques(choques)}", "⚠️")
             else:
                 flash("Turno actualizado")
             ss.cal_fecha = nuevo_ini.date().isoformat()
@@ -676,8 +744,9 @@ def mostrar_dialogo_pendiente():
 def fila_turno(t, prefijo, acciones=True, plantilla="tpl_recordatorio", con_fecha=False):
     c1, c2, c3, c4 = st.columns([1.1, 3, 1.6, 2.4], vertical_alignment="center")
     c1.markdown(f"**{t['inicio']:%d/%m}**  \n{t['inicio']:%H:%M}" if con_fecha else f"**{t['inicio']:%H:%M}**")
-    c2.markdown(f"{t['cliente']}  \n<span class='muted'>{t['servicios'] or 'Turno'} · {money(t['total'])}</span>",
-                unsafe_allow_html=True)
+    profesional = t["profesional"] if isinstance(t["profesional"], str) and t["profesional"] else SIN_ASIGNAR
+    c2.markdown(f"{t['cliente']}  \n<span class='muted'>{t['servicios'] or 'Turno'} · {money(t['total'])}"
+                f" · 👤 {profesional}</span>", unsafe_allow_html=True)
     c3.markdown(chip(t["estado"]) + (f"<br>{chip_sena(t['total'], t['sena_monto'])}"
                                       if t["estado"] in PENDIENTES else ""), unsafe_allow_html=True)
     b1, b2, b3 = c4.columns(3)
@@ -810,23 +879,48 @@ def pagina_agenda():
     ss.setdefault("cal_vista", "timeGridWeek")
     ss.setdefault("cal_fecha", ahora().date().isoformat())
 
-    c1, c2, c3 = st.columns([1.3, 1.3, 4], vertical_alignment="center")
+    turnos = q_turnos()
+    # 0 representa "Sin asignar" (los ids reales de profesionales empiezan en 1).
+    opciones_prof = [p["id"] for p in q_profesionales() if p["activo"]]
+    if any(not t["profesional_id"] for t in turnos):
+        opciones_prof.append(0)
+    if "cal_pros" in ss:
+        ss.cal_pros = [i for i in ss.cal_pros if i in opciones_prof]
+
+    c1, c2, c3, c4 = st.columns([1.2, 3.2, 1.2, 1.6], vertical_alignment="bottom")
     if c1.button("➕ Nuevo turno", type="primary", width="stretch"):
-        abrir_dialogo("nuevo")
-    ver_cancelados = c2.toggle("Ver cancelados", value=False)
-    c3.markdown(" ".join(chip(e) for e in ESTADOS)
-                + "<br><span class='muted'>⚠️ sin seña · 🟠 seña parcial · 💰 señado</span>", unsafe_allow_html=True)
+        unica = ss.get("cal_pros") or []
+        abrir_dialogo("nuevo", profesional_id=unica[0] if len(unica) == 1 and unica[0] else None)
+    filtro = c2.multiselect("Profesionales", opciones_prof, key="cal_pros", placeholder="Todas las profesionales",
+                            format_func=lambda i: nombre_profesional(i) if i else SIN_ASIGNAR)
+    ver_cancelados = c3.toggle("Cancelados", value=False)
+    color_por = c4.segmented_control("Color por", ["Estado", "Profesional"], default="Estado", key="cal_color") \
+        or "Estado"
+
+    if color_por == "Estado":
+        leyenda = " ".join(chip(e) for e in ESTADOS)
+    else:
+        leyenda = " ".join(f'<span class="chip" style="background:{color_profesional(i)}">'
+                           f'{nombre_profesional(i) if i else SIN_ASIGNAR}</span>' for i in (filtro or opciones_prof))
+    st.markdown(leyenda + "<br><span class='muted'>⚠️ sin seña · 🟠 seña parcial · 💰 señado</span>",
+                unsafe_allow_html=True)
 
     eventos = []
-    for t in q_turnos():
+    for t in turnos:
         if t["estado"] == "cancelado" and not ver_cancelados:
             continue
-        color = ESTADOS.get(t["estado"], ESTADOS["reservado"])[1]
+        if filtro and (t["profesional_id"] or 0) not in filtro:
+            continue
+        if color_por == "Estado":
+            color = ESTADOS.get(t["estado"], ESTADOS["reservado"])[1]
+        else:
+            color = color_profesional(t["profesional_id"])
         sena = estado_sena(t["total"], t["sena_monto"]) if t["estado"] in PENDIENTES else None
         icono = SENA_ESTADOS[sena][2] + " " if sena else ""
+        quien = (t["profesional"] or SIN_ASIGNAR).split()[0]
         eventos.append({
             "id": str(t["id"]),
-            "title": f"{icono}{t['nombre']} {t['apellido']} · {t['servicios'] or 'Turno'}",
+            "title": f"{icono}{t['nombre']} {t['apellido']} · {t['servicios'] or 'Turno'} · 👤 {quien}",
             "start": t["inicio"].isoformat(),
             "end": t["fin"].isoformat(),
             "backgroundColor": color,
@@ -890,7 +984,9 @@ def pagina_agenda():
             duracion = minutos if minutos > 30 else None
         ss.cal_fecha = ini.date().isoformat()
         ss.cal_key += 1
-        abrir_dialogo("nuevo", inicio=ini, duracion=duracion)
+        # Si la agenda está filtrada por una sola profesional, el turno se le asigna a ella.
+        unica = filtro[0] if len(filtro) == 1 and filtro[0] else None
+        abrir_dialogo("nuevo", inicio=ini, duracion=duracion, profesional_id=unica)
     elif callback == "eventClick":
         evento = estado["eventClick"]["event"]
         ss.cal_fecha = parse_iso(evento["start"]).date().isoformat()
@@ -900,10 +996,13 @@ def pagina_agenda():
         evento = estado["eventChange"]["event"]
         ini = parse_iso(evento["start"])
         fin = parse_iso(evento["end"]) if evento.get("end") else ini + timedelta(hours=1)
-        db.execute("UPDATE turnos SET fecha_inicio = %s, fecha_fin = %s WHERE id = %s", (ini, fin, int(evento["id"])))
-        choques = superposiciones(ini, fin, int(evento["id"]))
+        movido = db.execute("UPDATE turnos SET fecha_inicio = %s, fecha_fin = %s WHERE id = %s "
+                            "RETURNING profesional_id", (ini, fin, int(evento["id"])))
+        prof_id = movido["profesional_id"] if movido else None
+        choques = superposiciones(ini, fin, prof_id, int(evento["id"]))
         if choques:
-            flash("Turno movido, pero se superpone con otro", "⚠️")
+            flash(f"Turno movido, pero {nombre_profesional(prof_id)} ya tiene otro turno en ese horario: "
+                  f"{describir_choques(choques)}", "⚠️")
         else:
             flash(f"Turno movido a {fecha_larga(ini)} {ini:%H:%M} hs", "📅")
         ss.cal_fecha = ini.date().isoformat()
@@ -1053,12 +1152,13 @@ def ficha_cliente(c, turnos):
         if propios.empty:
             st.caption("Todavía no tiene turnos.")
         else:
-            vista = propios[["inicio", "servicios", "estado", "total", "sena_monto", "sena"]].copy()
+            vista = propios[["inicio", "servicios", "profesional", "estado", "total", "sena_monto", "sena"]].copy()
+            vista["profesional"] = vista["profesional"].fillna(SIN_ASIGNAR)
             vista["estado"] = vista["estado"].map(lambda e: ESTADOS.get(e, (e,))[0])
             vista["sena"] = vista["sena"].map(lambda s: " ".join(SENA_ESTADOS[s][2::-2]))
             st.dataframe(vista, hide_index=True, width="stretch", column_config={
                 "inicio": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY HH:mm"),
-                "servicios": "Servicios", "estado": "Estado",
+                "servicios": "Servicios", "profesional": "Profesional", "estado": "Estado",
                 "total": st.column_config.NumberColumn("Total", format="$%.0f"),
                 "sena_monto": st.column_config.NumberColumn("Seña pagada", format="$%.0f"),
                 "sena": "Seña"})
@@ -1127,7 +1227,97 @@ def pagina_clientes():
 
 
 def pagina_tratamientos():
-    st.title("💄 Tratamientos")
+    st.title("💄 Tratamientos y profesionales")
+    tab_trat, tab_prof = st.tabs(["💄 Tratamientos", "👩‍⚕️ Profesionales"])
+    with tab_trat:
+        editor_tratamientos()
+    with tab_prof:
+        gestion_profesionales()
+
+
+def gestion_profesionales():
+    st.caption("Cada turno se asigna a una profesional. Dos turnos pueden estar **en el mismo horario** si los "
+               "atienden profesionales distintas; la app avisa solo cuando una misma profesional queda con dos "
+               "turnos a la vez. Para que alguien deje de aparecer al agendar, desmarcá **Activa**.")
+    original = pd.DataFrame(q_profesionales(), columns=["id", "nombre", "activo"])
+    editado = st.data_editor(
+        original, num_rows="dynamic", hide_index=True, width="stretch", key="editor_profesionales",
+        column_config={
+            "id": None,
+            "nombre": st.column_config.TextColumn("Profesional", required=True),
+            "activo": st.column_config.CheckboxColumn("Activa", default=True),
+        },
+    )
+    if st.button("💾 Guardar profesionales", type="primary"):
+        nombres = [n.strip().lower() for n in editado["nombre"] if isinstance(n, str) and n.strip()]
+        if len(nombres) != len(set(nombres)):
+            st.error("Hay dos profesionales con el mismo nombre. Si son la misma persona, usá **Unificar** más abajo.")
+        else:
+            ids_editados = set()
+            with db.transaction() as cur:
+                for _, fila in editado.iterrows():
+                    nombre = fila["nombre"].strip() if isinstance(fila["nombre"], str) else ""
+                    if not nombre:
+                        continue
+                    activo = bool(fila["activo"]) if pd.notna(fila["activo"]) else True
+                    if pd.isna(fila["id"]):
+                        cur.execute("INSERT INTO profesionales (nombre, activo) VALUES (%s, %s)", (nombre, activo))
+                    else:
+                        pid = int(fila["id"])
+                        ids_editados.add(pid)
+                        cur.execute("UPDATE profesionales SET nombre = %s, activo = %s WHERE id = %s",
+                                    (nombre, activo, pid))
+                        cur.execute("UPDATE turnos SET profesional = %s WHERE profesional_id = %s", (nombre, pid))
+                for borrado in set(original["id"].astype(int)) - ids_editados:
+                    cur.execute("SELECT 1 FROM turnos WHERE profesional_id = %s LIMIT 1", (borrado,))
+                    if cur.fetchone():
+                        cur.execute("UPDATE profesionales SET activo = FALSE WHERE id = %s", (borrado,))
+                    else:
+                        cur.execute("DELETE FROM profesionales WHERE id = %s", (borrado,))
+            invalidar()
+            flash("Profesionales guardadas")
+            st.rerun()
+
+    profesionales = q_profesionales()
+    if len(profesionales) >= 2:
+        with st.expander("🔀 Unificar profesionales duplicadas"):
+            st.caption("Si la misma persona quedó cargada dos veces (por ejemplo «Karina» y «Karina Ordoñez»), "
+                       "pasá todos los turnos a un solo nombre. El nombre que se unifica se elimina.")
+            ids = [p["id"] for p in profesionales]
+            c1, c2, c3 = st.columns([2, 2, 1.2], vertical_alignment="bottom")
+            origen = c1.selectbox("Unificar", ids, format_func=nombre_profesional, index=None,
+                                  placeholder="Nombre a eliminar", key="unificar_origen")
+            destino = c2.selectbox("dentro de", [i for i in ids if i != origen], format_func=nombre_profesional,
+                                   index=None, placeholder="Nombre que queda", key="unificar_destino")
+            if c3.button("Unificar", disabled=not (origen and destino), width="stretch"):
+                with db.transaction() as cur:
+                    cur.execute("UPDATE turnos SET profesional_id = %s, profesional = %s WHERE profesional_id = %s",
+                                (destino, nombre_profesional(destino), origen))
+                    movidos = cur.rowcount
+                    cur.execute("DELETE FROM profesionales WHERE id = %s", (origen,))
+                invalidar()
+                flash(f"{movidos} turno(s) pasados a {nombre_profesional(destino)}")
+                st.rerun()
+
+    df = df_turnos()
+    if profesionales and not df.empty:
+        st.markdown("**📊 Este mes por profesional**")
+        mes_ini = pd.Timestamp(ahora().date()).replace(day=1)
+        mes = df[(df["inicio"] >= mes_ini) & (df["inicio"] < mes_ini + pd.offsets.MonthBegin(1))].copy()
+        mes["profesional"] = mes["profesional"].fillna(SIN_ASIGNAR)
+        resumen = mes.groupby("profesional").agg(
+            completados=("estado", lambda s: (s == "completado").sum()),
+            agendados=("estado", lambda s: s.isin(PENDIENTES).sum()),
+            facturado=("total", lambda s: s[mes.loc[s.index, "estado"] == "completado"].sum()),
+            sin_sena=("falta_sena", "sum"),
+        ).reset_index().sort_values("facturado", ascending=False)
+        st.dataframe(resumen, hide_index=True, width="stretch", column_config={
+            "profesional": "Profesional", "completados": "Turnos completados", "agendados": "Turnos agendados",
+            "facturado": st.column_config.NumberColumn("Facturado", format="$%.0f"),
+            "sin_sena": "⚠️ Sin seña"})
+
+
+def editor_tratamientos():
     st.caption("Editá directamente en la tabla. La **duración** se usa para calcular el fin del turno en la agenda. "
                "Para dejar de ofrecer un tratamiento desmarcá **Activo** (así se conserva el historial).")
     columnas = ["id", "nombre", "precio", "duracion_min", "activo", "descripcion"]
@@ -1288,7 +1478,12 @@ def pendientes():
     todos_60 = bool(trats) and all(t["duracion_min"] == 60 for t in trats)
     sin_origen = sum(1 for c in clientes if not c["origen"])
     sin_tel = sum(1 for c in clientes if not c["telefono"])
+    sin_profesional = sum(1 for t in q_turnos() if t["estado"] in PENDIENTES and not t["profesional_id"])
     return [
+        (sin_profesional == 0, "Asignar profesional a los turnos pendientes",
+         f"{sin_profesional} turno(s) pendientes sin profesional. Abrilos desde la Agenda (filtro «Sin asignar») "
+         "y elegí quién los atiende, así la app puede controlar las superposiciones."
+         if sin_profesional else "Todos los turnos pendientes tienen profesional."),
         (bool(cfg["clave_hash"]), "Poner contraseña a la app",
          "Hoy cualquiera con el link ve clientes e historias clínicas. Configurala más abajo en esta página."),
         (False, "Proteger la base de datos",
@@ -1329,6 +1524,10 @@ def pagina_instrucciones():
 2. **Durante el día — 📅 Agenda.** Para agendar, **arrastrá sobre un horario libre** (o usá *➕ Nuevo turno*).
    Para reprogramar, **arrastrá el turno** a otro horario o estiralo para cambiar la duración.
    Haciendo **clic en un turno** ves el detalle, la seña, las alergias del cliente y podés editarlo.
+   **Profesionales:** cada turno se asigna a una profesional. Puede haber **varios turnos en el mismo horario**
+   si los atienden profesionales distintas; la app solo avisa cuando la *misma* profesional queda con dos
+   turnos a la vez, y te muestra quién está libre en ese horario. Arriba del calendario podés **filtrar por
+   profesional** (si filtrás por una sola, los turnos nuevos se le asignan a ella) y **colorear por profesional**.
 3. **Seña.** Todos los turnos se señan con un porcentaje del precio final (50% por defecto; se cambia en
    *📣 Marketing → ⚙️ Configuración*):
    - Si ya la pagó al reservar, activá **"Ya pagó la seña"** en el formulario del turno.
@@ -1356,7 +1555,9 @@ def pagina_instrucciones():
 
 ### Secciones
 - **👥 Clientes:** buscador, ficha con datos de contacto, visitas, gasto total, **historia clínica** y turnos.
-- **💄 Tratamientos:** precios y duraciones. Para dejar de ofrecer uno, desmarcá *Activo* (no se borra el historial).
+- **💄 Tratamientos y profesionales:** precios y duraciones de los tratamientos (para dejar de ofrecer uno,
+  desmarcá *Activo*; no se borra el historial). En la pestaña **👩‍⚕️ Profesionales** se cargan las personas
+  que atienden, se **unifican** nombres duplicados y se ve lo facturado en el mes por cada una.
 - **📣 Marketing:** listas listas para escribir por WhatsApp (clientes que no vuelven, cumpleaños, una sola visita,
   mejores clientes) con mensajes personalizados que editás en *⚙️ Plantillas*. En *📈 Canales* ves qué medio
   (Instagram, recomendación, etc.) trae clientes que más gastan. En *⚙️ Configuración* se cargan el
@@ -1381,6 +1582,7 @@ en el navegador ni en otros servicios.
 | **Historia clínica** | Antecedentes (alergias, medicación, contraindicaciones, otros, consentimiento) y entradas fechadas con autor |
 | **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio final, notas y **seña** (monto pagado, fecha y medio de pago) |
 | **Tratamientos** | Nombre, precio, duración, descripción y si está activo |
+| **Profesionales** | Nombre y si está activa |
 | **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
 
 **Qué *no* se guarda:** el cobro del saldo el día del turno (solo el precio final), comprobantes de pago,
@@ -1408,7 +1610,8 @@ seguridad de la pestaña *🚀 Próximos pasos*.
 - **Recordatorios automáticos** por WhatsApp Business API, sin tener que tocar el botón.
 - **Cobro de la seña con link de Mercado Pago**, que se marque como pagada sola al acreditarse.
 - **Reserva online** para que los clientes elijan horario solos desde Instagram.
-- **Agenda por profesional o por cabina**, si atienden varias personas a la vez.
+- **Agenda por cabina o aparato**, además de por profesional.
+- **Horarios de trabajo por profesional**, para no ofrecer turnos cuando no está.
 - **Fotos de antes y después** dentro de la historia clínica.
 - **Usuarios individuales** para saber quién hizo cada cambio.
 """)
