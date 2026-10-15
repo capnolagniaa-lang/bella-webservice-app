@@ -220,6 +220,14 @@ _MIGRATIONS = [
     """UPDATE turnos t SET profesional_id = p.id FROM profesionales p
        WHERE t.profesional_id IS NULL AND lower(trim(t.profesional)) = lower(p.nombre)""",
     "CREATE INDEX IF NOT EXISTS turnos_profesional_idx ON turnos (profesional_id, fecha_inicio)",
+    # Descuento: lo elige quien carga el turno como porcentaje sobre el precio de lista.
+    "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS precio_lista NUMERIC(12,2)",
+    "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS descuento_porcentaje NUMERIC(5,2)",
+    "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS descuento_monto NUMERIC(12,2)",
+    # Se descartó el catálogo de descuentos (nunca llegó a usarse).
+    "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_id",
+    "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_nombre",
+    "DROP TABLE IF EXISTS descuentos",
     "CREATE INDEX IF NOT EXISTS turnos_fecha_inicio_idx ON turnos (fecha_inicio)",
     "CREATE INDEX IF NOT EXISTS turnos_cliente_idx ON turnos (cliente_id)",
     """CREATE TABLE IF NOT EXISTS turno_tratamientos (

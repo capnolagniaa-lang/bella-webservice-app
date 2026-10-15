@@ -301,6 +301,20 @@ def q_tratamientos():
     return rows
 
 
+def aplicar_descuento(precio_lista, porcentaje):
+    """Precio final con el porcentaje que elige quien carga el turno."""
+    return float(precio_lista or 0) - round(float(precio_lista or 0) * float(porcentaje or 0) / 100)
+
+
+def datos_descuento(precio_lista, total):
+    """(porcentaje, monto) efectivamente descontados; (None, None) si no hay descuento."""
+    lista = float(precio_lista or 0)
+    rebaja = round(max(0.0, lista - float(total or 0)))
+    if not rebaja or not lista:
+        return None, None
+    return round(rebaja / lista * 100, 2), float(rebaja)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def q_profesionales():
     return db.fetch("SELECT id, nombre, activo FROM profesionales ORDER BY nombre")
@@ -334,8 +348,8 @@ def elegir_profesional(columna, etiqueta, actual=None, key=None):
 
 
 TURNO_COLS = ["id", "cliente_id", "inicio", "fin", "servicios", "profesional", "profesional_id", "estado", "notas",
-              "total", "sena_monto", "sena_fecha", "sena_medio", "nombre", "apellido", "telefono",
-              "acepta_mensajes"]
+              "total", "precio_lista", "descuento_porcentaje", "descuento_monto",
+              "sena_monto", "sena_fecha", "sena_medio", "nombre", "apellido", "telefono", "acepta_mensajes"]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -343,7 +357,8 @@ def q_turnos():
     rows = db.fetch(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
                   COALESCE(p.nombre, t.profesional) AS profesional, t.profesional_id, t.estado, t.notas,
-                  t.total, t.sena_monto, t.sena_fecha, t.sena_medio,
+                  t.total, t.precio_lista, t.descuento_porcentaje, t.descuento_monto,
+                  t.sena_monto, t.sena_fecha, t.sena_medio,
                   c.nombre, c.apellido, c.telefono, c.acepta_mensajes
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id
            LEFT JOIN profesionales p ON p.id = t.profesional_id
@@ -353,6 +368,9 @@ def q_turnos():
         r["inicio"] = naive(r["inicio"])
         r["fin"] = naive(r["fin"]) or r["inicio"] + timedelta(hours=1)
         r["total"] = float(r["total"] or 0)
+        r["precio_lista"] = float(r["precio_lista"]) if r["precio_lista"] is not None else r["total"]
+        r["descuento_monto"] = float(r["descuento_monto"] or 0)
+        r["descuento_porcentaje"] = float(r["descuento_porcentaje"] or 0)
         r["sena_monto"] = float(r["sena_monto"] or 0)
         r["sena_fecha"] = naive(r["sena_fecha"])
     return rows
@@ -513,10 +531,18 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
     hora = c2.time_input("Hora", inicio.time(), step=timedelta(minutes=15))
     minutos = c3.number_input("Duración (min)", 15, 720, min(720, int(duracion_sugerida)), step=15)
     c1, c2, c3 = st.columns(3)
-    total = c1.number_input("Precio final ($)", 0.0, value=float(precio_lista), step=500.0,
-                            help="Precio de lista: suma de los tratamientos. Podés aplicar un descuento.")
-    estado = c2.selectbox("Estado", list(PENDIENTES), format_func=lambda e: ESTADOS[e][0])
-    prof_id, prof_nombre = elegir_profesional(c3, "Profesional *", profesional_id)
+    c1.markdown(f"Precio de lista  \n**{money(precio_lista)}**")
+    porcentaje = c2.number_input("Descuento (%)", 0.0, 100.0, 0.0, step=5.0, format="%g")
+    total = c3.number_input("Precio final ($)", 0.0, value=aplicar_descuento(precio_lista, porcentaje), step=500.0,
+                            help="Se calcula con el descuento. Podés ajustarlo a mano (por ejemplo, para redondear).")
+    if precio_lista and total != precio_lista:
+        diferencia = precio_lista - total
+        st.caption(f"Precio de lista {money(precio_lista)} "
+                   + (f"− descuento {money(diferencia)}" if diferencia > 0 else f"+ recargo {money(-diferencia)}")
+                   + f" = **{money(total)}**")
+    c1, c2 = st.columns(2)
+    estado = c1.selectbox("Estado", list(PENDIENTES), format_func=lambda e: ESTADOS[e][0])
+    prof_id, prof_nombre = elegir_profesional(c2, "Profesional *", profesional_id)
     hay_profesionales = any(p["activo"] for p in q_profesionales())
     notas = st.text_area("Notas del turno", placeholder="Ej.: trae su propio esmalte, alergia a…", height=80)
 
@@ -569,6 +595,7 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
             st.error("Elegí al menos un tratamiento.")
             return
         servicios = ", ".join(t["nombre"] for t in elegidos)
+        desc_pct, desc_monto = datos_descuento(precio_lista, total)
         con_sena = pago_sena and monto_sena > 0
         if con_sena and estado == "reservado" and estado_sena(total, monto_sena) == "senado":
             estado = "confirmado"
@@ -579,9 +606,11 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
                 cli_id = cur.fetchone()["id"]
             cur.execute(
                 """INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, servicios, profesional, profesional_id,
-                                       estado, notas, total, sena_monto, sena_fecha, sena_medio)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                                       estado, notas, total, precio_lista, descuento_porcentaje,
+                                       descuento_monto, sena_monto, sena_fecha, sena_medio)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (cli_id, ini, fin, servicios, prof_nombre, prof_id, estado, notas or None, total,
+                 precio_lista, desc_pct, desc_monto,
                  monto_sena if con_sena else None, ahora() if con_sena else None, medio_sena if con_sena else None),
             )
             turno_id = cur.fetchone()["id"]
@@ -603,7 +632,8 @@ def dialogo_turno(turno_id):
     t = db.fetch_one(
         """SELECT t.id, t.cliente_id, t.fecha_inicio AS inicio, t.fecha_fin AS fin, t.servicios,
                   COALESCE(p.nombre, t.profesional) AS profesional, t.profesional_id, t.estado, t.notas,
-                  t.total, t.sena_monto, t.sena_fecha, t.sena_medio, c.nombre, c.apellido, c.telefono
+                  t.total, t.precio_lista, t.descuento_porcentaje, t.descuento_monto,
+                  t.sena_monto, t.sena_fecha, t.sena_medio, c.nombre, c.apellido, c.telefono
            FROM turnos t JOIN clientes c ON c.id = t.cliente_id
            LEFT JOIN profesionales p ON p.id = t.profesional_id WHERE t.id = %s""",
         (turno_id,),
@@ -613,11 +643,18 @@ def dialogo_turno(turno_id):
         return
     ini = naive(t["inicio"])
     fin = naive(t["fin"]) or ini + timedelta(hours=1)
+    # Turnos anteriores a los descuentos no tienen precio de lista: se toma el total.
+    lista = float(t["precio_lista"] if t["precio_lista"] is not None else t["total"] or 0)
+    pct_actual = float(t["descuento_porcentaje"] or 0)
 
     st.markdown(f"### {t['nombre']} {t['apellido']} {chip(t['estado'])} {chip_sena(t['total'], t['sena_monto'])}",
                 unsafe_allow_html=True)
+    precio = money(t["total"])
+    if t["descuento_monto"]:
+        precio = (f"~~{money(lista)}~~ **{money(t['total'])}** "
+                  f"(🏷️ {pct_actual:g}% −{money(t['descuento_monto'])})")
     st.markdown(f"**{fecha_larga(ini).capitalize()}**, {ini:%H:%M} a {fin:%H:%M} hs · {t['servicios'] or 'Turno'}"
-                f" · {money(t['total'])} · 👤 {t['profesional'] or SIN_ASIGNAR}")
+                f" · {precio} · 👤 {t['profesional'] or SIN_ASIGNAR}")
     alerta_antecedentes(t["cliente_id"])
     seccion_sena(t)
 
@@ -647,9 +684,14 @@ def dialogo_turno(turno_id):
         estados = list(ESTADOS)
         estado = c1.selectbox("Estado", estados, index=estados.index(t["estado"]) if t["estado"] in ESTADOS else 0,
                               format_func=lambda e: ESTADOS[e][0])
-        total = c2.number_input("Precio final ($)", 0.0, value=float(t["total"] or 0), step=500.0)
-        prof_id, prof_nombre = elegir_profesional(c3, "Profesional", t["profesional_id"],
+        prof_id, prof_nombre = elegir_profesional(c2, "Profesional", t["profesional_id"],
                                                   key=f"prof_turno_{turno_id}")
+        c3.markdown(f"<br>Precio de lista: **{money(lista)}**", unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        porcentaje = c1.number_input("Descuento (%)", 0.0, 100.0, pct_actual, step=5.0, format="%g",
+                                     help="Si cambiás el porcentaje, el precio final se recalcula al guardar.")
+        total = c2.number_input("Precio final ($)", 0.0, value=float(t["total"] or 0), step=500.0,
+                                help="Si dejás el mismo porcentaje, se guarda este precio (sirve para ajustes a mano).")
         servicios = st.text_input("Servicios", t["servicios"] or "")
         notas = st.text_area("Notas", t["notas"] or "", height=80)
         if st.form_submit_button("💾 Guardar cambios", type="primary", width="stretch"):
@@ -657,13 +699,18 @@ def dialogo_turno(turno_id):
             nuevo_fin = nuevo_ini + timedelta(minutes=int(minutos))
             if prof_nombre is None:  # sin profesionales cargadas: se conserva el texto anterior
                 prof_nombre = t["profesional"]
+            if porcentaje != pct_actual:
+                total = aplicar_descuento(lista, porcentaje)
+            desc_pct, desc_monto = datos_descuento(lista, total)
             with db.transaction() as cur:
                 if estado == "completado" and t["estado"] != "completado":
                     _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, prof_nombre)
                 cur.execute(
-                    """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, profesional=%s,
+                    """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, precio_lista=%s,
+                                         descuento_porcentaje=%s, descuento_monto=%s, profesional=%s,
                                          profesional_id=%s, servicios=%s, notas=%s WHERE id=%s""",
-                    (nuevo_ini, nuevo_fin, estado, total, prof_nombre, prof_id, servicios, notas or None, turno_id),
+                    (nuevo_ini, nuevo_fin, estado, total, lista, desc_pct, desc_monto,
+                     prof_nombre, prof_id, servicios, notas or None, turno_id),
                 )
             choques = superposiciones(nuevo_ini, nuevo_fin, prof_id, turno_id) if estado in OCUPAN_AGENDA else []
             if choques:
@@ -745,7 +792,9 @@ def fila_turno(t, prefijo, acciones=True, plantilla="tpl_recordatorio", con_fech
     c1, c2, c3, c4 = st.columns([1.1, 3, 1.6, 2.4], vertical_alignment="center")
     c1.markdown(f"**{t['inicio']:%d/%m}**  \n{t['inicio']:%H:%M}" if con_fecha else f"**{t['inicio']:%H:%M}**")
     profesional = t["profesional"] if isinstance(t["profesional"], str) and t["profesional"] else SIN_ASIGNAR
-    c2.markdown(f"{t['cliente']}  \n<span class='muted'>{t['servicios'] or 'Turno'} · {money(t['total'])}"
+    pct = t.get("descuento_porcentaje")
+    descuento = f" (🏷️ −{pct:g}%)" if isinstance(pct, (int, float)) and pct > 0 else ""
+    c2.markdown(f"{t['cliente']}  \n<span class='muted'>{t['servicios'] or 'Turno'} · {money(t['total'])}{descuento}"
                 f" · 👤 {profesional}</span>", unsafe_allow_html=True)
     c3.markdown(chip(t["estado"]) + (f"<br>{chip_sena(t['total'], t['sena_monto'])}"
                                       if t["estado"] in PENDIENTES else ""), unsafe_allow_html=True)
@@ -1152,7 +1201,9 @@ def ficha_cliente(c, turnos):
         if propios.empty:
             st.caption("Todavía no tiene turnos.")
         else:
-            vista = propios[["inicio", "servicios", "profesional", "estado", "total", "sena_monto", "sena"]].copy()
+            vista = propios[["inicio", "servicios", "profesional", "estado", "total", "descuento_porcentaje",
+                             "sena_monto", "sena"]].copy()
+            vista["descuento_porcentaje"] = vista["descuento_porcentaje"].map(lambda p: f"{p:g}%" if p else "")
             vista["profesional"] = vista["profesional"].fillna(SIN_ASIGNAR)
             vista["estado"] = vista["estado"].map(lambda e: ESTADOS.get(e, (e,))[0])
             vista["sena"] = vista["sena"].map(lambda s: " ".join(SENA_ESTADOS[s][2::-2]))
@@ -1160,6 +1211,7 @@ def ficha_cliente(c, turnos):
                 "inicio": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY HH:mm"),
                 "servicios": "Servicios", "profesional": "Profesional", "estado": "Estado",
                 "total": st.column_config.NumberColumn("Total", format="$%.0f"),
+                "descuento_porcentaje": "Descuento",
                 "sena_monto": st.column_config.NumberColumn("Seña pagada", format="$%.0f"),
                 "sena": "Seña"})
 
@@ -1528,7 +1580,10 @@ def pagina_instrucciones():
    si los atienden profesionales distintas; la app solo avisa cuando la *misma* profesional queda con dos
    turnos a la vez, y te muestra quién está libre en ese horario. Arriba del calendario podés **filtrar por
    profesional** (si filtrás por una sola, los turnos nuevos se le asignan a ella) y **colorear por profesional**.
-3. **Seña.** Todos los turnos se señan con un porcentaje del precio final (50% por defecto; se cambia en
+3. **Descuentos.** Al agendar, escribí el **porcentaje de descuento** que corresponda y el precio final se
+   calcula solo (también podés ajustarlo a mano, por ejemplo para redondear). Se guardan el precio de lista,
+   el porcentaje y el monto descontado. La seña se calcula sobre el precio **con** descuento.
+4. **Seña.** Todos los turnos se señan con un porcentaje del precio final (50% por defecto; se cambia en
    *📣 Marketing → ⚙️ Configuración*):
    - Si ya la pagó al reservar, activá **"Ya pagó la seña"** en el formulario del turno.
    - Si no, el turno queda **⚠️ Sin seña**. Pedila con **💬 Pedir la seña por WhatsApp** (el mensaje incluye el
@@ -1536,12 +1591,12 @@ def pagina_instrucciones():
    - Se pueden registrar pagos parciales: el turno queda **🟠 Seña parcial** hasta completar el monto.
    - Al quedar señado, un turno *Reservado* pasa solo a **Confirmado**.
    - En el calendario: ⚠️ sin seña (con borde rojo punteado), 🟠 parcial y 💰 señado.
-4. **Después de atender** cobrá el saldo (el detalle del turno muestra cuánto resta) y tocá
+5. **Después de atender** cobrá el saldo (el detalle del turno muestra cuánto resta) y tocá
    **✅ Marcar completado**. Eso:
    - suma el importe a la facturación,
    - agrega una entrada automática en la **historia clínica**,
    - habilita el mensaje de **pedido de reseña**.
-5. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
+6. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
    los turnos que hayan quedado abiertos, así los números son reales.
 
 ### Estados de un turno
@@ -1580,7 +1635,7 @@ en el navegador ni en otros servicios.
 |---|---|
 | **Clientes** | Nombre, apellido, WhatsApp, email, domicilio, edad o fecha de nacimiento, cómo te conoció, si acepta promociones y fecha de alta |
 | **Historia clínica** | Antecedentes (alergias, medicación, contraindicaciones, otros, consentimiento) y entradas fechadas con autor |
-| **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio final, notas y **seña** (monto pagado, fecha y medio de pago) |
+| **Turnos** | Cliente, fecha y hora de inicio y fin, tratamientos, profesional, estado, precio de lista, **descuento** aplicado (porcentaje y monto), precio final, notas y **seña** (monto pagado, fecha y medio de pago) |
 | **Tratamientos** | Nombre, precio, duración, descripción y si está activo |
 | **Profesionales** | Nombre y si está activa |
 | **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
@@ -1679,6 +1734,9 @@ except db.DBError as e:
     if st.button("🔄 Reintentar"):
         st.rerun()
     st.stop()
+
+if ss.get("pagina") not in PAGINAS:  # p. ej. una página que ya no existe
+    ss.pop("pagina", None)
 
 if "goto" in ss:
     pagina_destino, cliente_destino = ss.pop("goto")
