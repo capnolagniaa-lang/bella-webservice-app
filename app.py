@@ -658,69 +658,43 @@ def dialogo_turno(turno_id):
     alerta_antecedentes(t["cliente_id"])
     seccion_sena(t)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     url = link_wa(t["telefono"], mensaje("tpl_recordatorio", **datos_turno_msg(t)))
     if url:
-        c1.link_button("💬 Recordatorio por WhatsApp", url, width="stretch")
+        c1.link_button("💬 Recordatorio", url, width="stretch")
     else:
         c1.caption("Sin teléfono cargado")
-    if t["estado"] in PENDIENTES and c2.button("✅ Marcar completado", width="stretch"):
+    if t["estado"] in PENDIENTES and c2.button("✅ Completado", width="stretch"):
         cambiar_estado([turno_id], "completado")
         invalidar()
         flash("Turno completado y registrado en la historia clínica")
         st.rerun()
-    if c3.button("👤 Ver ficha del cliente", width="stretch"):
+    if t["estado"] in PENDIENTES:
+        with c3.popover("🚫 Cancelar", width="stretch"):
+            motivo = st.text_input("Motivo (opcional)", key=f"motivo_cancel_{turno_id}",
+                                   placeholder="Ej.: avisó que está enferma")
+            if t["sena_monto"]:
+                st.caption(f"La seña de {money(t['sena_monto'])} queda registrada en el turno cancelado.")
+            if st.button("Confirmar cancelación", type="primary", key=f"cancelar_{turno_id}", width="stretch"):
+                nota = f"[Cancelado el {ahora():%d/%m/%Y %H:%M}" + (f": {motivo.strip()}]" if motivo.strip() else "]")
+                db.execute("""UPDATE turnos SET estado = 'cancelado',
+                                     notas = concat_ws(E'\\n', NULLIF(notas, ''), %s) WHERE id = %s""",
+                           (nota, turno_id))
+                invalidar()
+                flash("Turno cancelado (se oculta de la agenda; activá «Cancelados» para verlo)", "🚫")
+                st.rerun()
+    elif t["estado"] == "cancelado" and c3.button("↩️ Reactivar", width="stretch"):
+        db.execute("UPDATE turnos SET estado = 'reservado' WHERE id = %s", (turno_id,))
+        choques = superposiciones(ini, fin, t["profesional_id"], turno_id)
+        invalidar()
+        flash("Turno reactivado" + (f", pero choca con: {describir_choques(choques)}" if choques else ""),
+              "⚠️" if choques else "↩️")
+        st.rerun()
+    if c4.button("👤 Ver ficha", width="stretch"):
         ir_a("👥 Clientes", t["cliente_id"])
         st.rerun()
 
-    with st.form(f"editar_turno_{turno_id}", border=True):
-        st.markdown("**Editar / reprogramar**")
-        c1, c2, c3 = st.columns(3)
-        fecha = c1.date_input("Fecha", ini.date(), format="DD/MM/YYYY")
-        hora = c2.time_input("Hora", ini.time(), step=timedelta(minutes=15))
-        minutos = c3.number_input("Duración (min)", 15, 720,
-                                  min(720, max(15, int((fin - ini).total_seconds() // 60))), step=15)
-        c1, c2, c3 = st.columns(3)
-        estados = list(ESTADOS)
-        estado = c1.selectbox("Estado", estados, index=estados.index(t["estado"]) if t["estado"] in ESTADOS else 0,
-                              format_func=lambda e: ESTADOS[e][0])
-        prof_id, prof_nombre = elegir_profesional(c2, "Profesional", t["profesional_id"],
-                                                  key=f"prof_turno_{turno_id}")
-        c3.markdown(f"<br>Precio de lista: **{money(lista)}**", unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        porcentaje = c1.number_input("Descuento (%)", 0.0, 100.0, pct_actual, step=5.0, format="%g",
-                                     help="Si cambiás el porcentaje, el precio final se recalcula al guardar.")
-        total = c2.number_input("Precio final ($)", 0.0, value=float(t["total"] or 0), step=500.0,
-                                help="Si dejás el mismo porcentaje, se guarda este precio (sirve para ajustes a mano).")
-        servicios = st.text_input("Servicios", t["servicios"] or "")
-        notas = st.text_area("Notas", t["notas"] or "", height=80)
-        if st.form_submit_button("💾 Guardar cambios", type="primary", width="stretch"):
-            nuevo_ini = datetime.combine(fecha, hora).replace(second=0)
-            nuevo_fin = nuevo_ini + timedelta(minutes=int(minutos))
-            if prof_nombre is None:  # sin profesionales cargadas: se conserva el texto anterior
-                prof_nombre = t["profesional"]
-            if porcentaje != pct_actual:
-                total = aplicar_descuento(lista, porcentaje)
-            desc_pct, desc_monto = datos_descuento(lista, total)
-            with db.transaction() as cur:
-                if estado == "completado" and t["estado"] != "completado":
-                    _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, prof_nombre)
-                cur.execute(
-                    """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, precio_lista=%s,
-                                         descuento_porcentaje=%s, descuento_monto=%s, profesional=%s,
-                                         profesional_id=%s, servicios=%s, notas=%s WHERE id=%s""",
-                    (nuevo_ini, nuevo_fin, estado, total, lista, desc_pct, desc_monto,
-                     prof_nombre, prof_id, servicios, notas or None, turno_id),
-                )
-            choques = superposiciones(nuevo_ini, nuevo_fin, prof_id, turno_id) if estado in OCUPAN_AGENDA else []
-            if choques:
-                flash(f"Guardado, pero {prof_nombre or 'la agenda'} ya tiene otro turno en ese horario: "
-                      f"{describir_choques(choques)}", "⚠️")
-            else:
-                flash("Turno actualizado")
-            ss.cal_fecha = nuevo_ini.date().isoformat()
-            invalidar()
-            st.rerun()
+    editar_turno(t, lista, pct_actual)
 
     with st.expander("🗑️ Eliminar turno"):
         st.caption("Si el cliente canceló, conviene marcarlo como **Cancelado** para conservar el historial.")
@@ -729,6 +703,112 @@ def dialogo_turno(turno_id):
             db.execute("DELETE FROM turnos WHERE id = %s", (turno_id,))
             invalidar()
             flash("Turno eliminado", "🗑️")
+            st.rerun()
+
+
+def editar_turno(t, lista, pct_actual):
+    """Edición del turno. Sin st.form para que precio, duración y superposición se recalculen en el momento."""
+    turno_id = t["id"]
+    ini = naive(t["inicio"])
+    fin = naive(t["fin"]) or ini + timedelta(hours=1)
+    minutos_actuales = min(720, max(15, int((fin - ini).total_seconds() // 60)))
+    catalogo = {x["id"]: x for x in q_tratamientos()}
+    vinculados = {r["tratamiento_id"]: float(r["precio"]) if r["precio"] is not None else None
+                  for r in db.fetch("SELECT tratamiento_id, precio FROM turno_tratamientos WHERE turno_id = %s",
+                                    (turno_id,))}
+    sueltos = []
+    if not vinculados and t["servicios"]:
+        # Turnos cargados antes de vincular tratamientos: se reconocen por nombre.
+        por_nombre = {x["nombre"].strip().lower(): x["id"] for x in catalogo.values()}
+        for nombre in re.split(r",\s*", t["servicios"]):
+            if nombre.strip().lower() in por_nombre:
+                vinculados[por_nombre[nombre.strip().lower()]] = None
+            elif nombre.strip():
+                sueltos.append(nombre.strip())
+    actuales = list(vinculados)
+
+    def precio(i):
+        return vinculados[i] if vinculados.get(i) is not None else catalogo[i]["precio"]
+
+    with st.container(border=True):
+        st.markdown("**✏️ Editar turno**")
+        opciones = [i for i, x in catalogo.items() if x["activo"] or i in vinculados]
+        elegidos = st.multiselect(
+            "Tratamientos", opciones, default=actuales, key=f"trat_turno_{turno_id}",
+            format_func=lambda i: f"{catalogo[i]['nombre']} · {money(precio(i))} · {catalogo[i]['duracion_min']} min",
+            placeholder="Agregá o quitá tratamientos")
+        if sueltos:
+            st.caption(f"Servicios cargados a mano que no están en el catálogo: {', '.join(sueltos)}. "
+                       "Si cambiás los tratamientos, se reemplazan por los elegidos.")
+        cambiaron = set(elegidos) != set(actuales)
+        nueva_lista = float(sum(precio(i) for i in elegidos)) if cambiaron else lista
+        duracion_default = (min(720, sum(catalogo[i]["duracion_min"] for i in elegidos) or minutos_actuales)
+                            if cambiaron else minutos_actuales)
+
+        c1, c2, c3 = st.columns(3)
+        fecha = c1.date_input("Fecha", ini.date(), format="DD/MM/YYYY", key=f"fecha_turno_{turno_id}")
+        hora = c2.time_input("Hora", ini.time(), step=timedelta(minutes=15), key=f"hora_turno_{turno_id}")
+        minutos = c3.number_input("Duración (min)", 15, 720, duracion_default, step=15,
+                                  help="Se ajusta sola al agregar o quitar tratamientos.")
+        c1, c2 = st.columns(2)
+        estados = list(ESTADOS)
+        estado = c1.selectbox("Estado", estados, index=estados.index(t["estado"]) if t["estado"] in ESTADOS else 0,
+                              format_func=lambda e: ESTADOS[e][0], key=f"estado_turno_{turno_id}")
+        prof_id, prof_nombre = elegir_profesional(c2, "Profesional", t["profesional_id"],
+                                                  key=f"prof_turno_{turno_id}")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"Precio de lista  \n**{money(nueva_lista)}**"
+                    + (f" <span class='muted'>(antes {money(lista)})</span>" if nueva_lista != lista else ""),
+                    unsafe_allow_html=True)
+        porcentaje = c2.number_input("Descuento (%)", 0.0, 100.0, pct_actual, step=5.0, format="%g",
+                                     key=f"pct_turno_{turno_id}")
+        recalcular = cambiaron or porcentaje != pct_actual
+        total = c3.number_input("Precio final ($)", 0.0, step=500.0,
+                                value=aplicar_descuento(nueva_lista, porcentaje) if recalcular else float(t["total"] or 0),
+                                help="Se recalcula al cambiar tratamientos o descuento. Podés ajustarlo a mano.")
+        if total != float(t["total"] or 0):
+            st.caption(f"💲 El precio pasa de {money(t['total'])} a **{money(total)}**. "
+                       f"Seña requerida: {money(sena_requerida(total))}"
+                       + (f" (ya pagó {money(t['sena_monto'])})" if t["sena_monto"] else "") + ".")
+        notas = st.text_area("Notas", t["notas"] or "", height=80, key=f"notas_turno_{turno_id}")
+
+        nuevo_ini = datetime.combine(fecha, hora).replace(second=0)
+        nuevo_fin = nuevo_ini + timedelta(minutes=int(minutos))
+        choques = superposiciones(nuevo_ini, nuevo_fin, prof_id, turno_id) if estado in OCUPAN_AGENDA else []
+        if choques:
+            libres = profesionales_libres(nuevo_ini, nuevo_fin, turno_id)
+            st.warning(f"**{prof_nombre or 'La agenda'}** ya tiene turno en ese horario: {describir_choques(choques)}."
+                       + (f"  \n✅ Libres: **{', '.join(libres)}**." if libres else ""))
+
+        if st.button("💾 Guardar cambios", type="primary", width="stretch", key=f"guardar_turno_{turno_id}"):
+            if cambiaron and not elegidos:
+                st.error("El turno tiene que tener al menos un tratamiento. Si no viene, usá «🚫 Cancelar».")
+                return
+            if prof_nombre is None:  # sin profesionales cargadas: se conserva el texto anterior
+                prof_nombre = t["profesional"]
+            servicios = ", ".join(catalogo[i]["nombre"] for i in elegidos) if cambiaron else t["servicios"]
+            desc_pct, desc_monto = datos_descuento(nueva_lista, total)
+            with db.transaction() as cur:
+                if estado == "completado" and t["estado"] != "completado":
+                    _anotar_historia(cur, turno_id, t["cliente_id"], nuevo_ini, servicios, prof_nombre)
+                cur.execute(
+                    """UPDATE turnos SET fecha_inicio=%s, fecha_fin=%s, estado=%s, total=%s, precio_lista=%s,
+                                         descuento_porcentaje=%s, descuento_monto=%s, profesional=%s,
+                                         profesional_id=%s, servicios=%s, notas=%s WHERE id=%s""",
+                    (nuevo_ini, nuevo_fin, estado, total, nueva_lista, desc_pct, desc_monto,
+                     prof_nombre, prof_id, servicios, notas or None, turno_id),
+                )
+                if cambiaron:
+                    cur.execute("DELETE FROM turno_tratamientos WHERE turno_id = %s", (turno_id,))
+                    for i in elegidos:
+                        cur.execute("INSERT INTO turno_tratamientos (turno_id, tratamiento_id, precio) "
+                                    "VALUES (%s, %s, %s)", (turno_id, i, precio(i)))
+            if choques:
+                flash(f"Guardado, pero {prof_nombre or 'la agenda'} ya tiene otro turno en ese horario", "⚠️")
+            else:
+                flash("Turno actualizado" + (f": {servicios}" if cambiaron else ""))
+            ss.cal_fecha = nuevo_ini.date().isoformat()
+            invalidar()
             st.rerun()
 
 
@@ -1575,7 +1655,10 @@ def pagina_instrucciones():
    **recordatorios para mañana** (botón 💬). Cuando el cliente confirme, tocá 👍 para marcarlo como *Confirmado*.
 2. **Durante el día — 📅 Agenda.** Para agendar, **arrastrá sobre un horario libre** (o usá *➕ Nuevo turno*).
    Para reprogramar, **arrastrá el turno** a otro horario o estiralo para cambiar la duración.
-   Haciendo **clic en un turno** ves el detalle, la seña, las alergias del cliente y podés editarlo.
+   Haciendo **clic en un turno** ves el detalle, la seña, las alergias del cliente y podés editarlo:
+   **agregar o quitar tratamientos** (el precio, el descuento y la duración se recalculan en el momento),
+   cambiar fecha, hora o profesional. Con **🚫 Cancelar** el turno queda cancelado con el motivo anotado
+   (no se borra; si hubo seña, queda registrada) y se puede volver atrás con **↩️ Reactivar**.
    **Profesionales:** cada turno se asigna a una profesional. Puede haber **varios turnos en el mismo horario**
    si los atienden profesionales distintas; la app solo avisa cuando la *misma* profesional queda con dos
    turnos a la vez, y te muestra quién está libre en ese horario. Arriba del calendario podés **filtrar por
