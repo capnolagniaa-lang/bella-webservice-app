@@ -104,6 +104,30 @@ CALENDAR_CSS = """
 .fc .fc-button-primary:not(:disabled):active { background: #A8305C; border-color: #A8305C; }
 .fc .fc-timegrid-now-indicator-line { border-color: #D6457A; }
 .fc-event.sin-sena { border-width: 2px; border-style: dashed; }
+
+/* Vista previa al pasar el mouse: el título trae varias líneas con el detalle del turno.
+   En reposo se ve lo que entra en el bloque; con el mouse encima la tarjeta crece y queda al frente. */
+.fc-event-title { white-space: pre-line; line-height: 1.25; }
+.fc-timegrid-event .fc-event-main, .fc-timegrid-event .fc-event-title-container { overflow: hidden; }
+.fc-timegrid-event-harness:hover { z-index: 60 !important; }
+/* Cada día es una capa propia: el día con el mouse encima pasa al frente para que la tarjeta tape a sus vecinos. */
+.fc-timegrid-col:hover .fc-timegrid-col-events { z-index: 6; }
+.fc-timegrid-event-harness:hover > .fc-timegrid-event {
+    bottom: auto !important; right: auto !important; height: auto !important;
+    min-height: 100%; min-width: 100%; width: max-content; max-width: 280px;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, .28); padding: 4px 6px;
+}
+.fc-timegrid-event-harness:hover .fc-event-main,
+.fc-timegrid-event-harness:hover .fc-event-title-container { overflow: visible; }
+/* Vista mensual: una sola línea; con el mouse encima se despliega el detalle. */
+.fc-daygrid-event .fc-event-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-daygrid-event-harness:hover { z-index: 60; position: relative; }
+.fc-daygrid-event:hover {
+    white-space: normal; box-shadow: 0 8px 22px rgba(0, 0, 0, .28);
+    min-width: 230px; max-width: 280px; position: relative; z-index: 60;
+}
+.fc-daygrid-event:hover .fc-event-title { white-space: pre-line; overflow: visible; }
+.fc-daygrid-dot-event:hover { background: #fff; color: #2B1F26; }
 """
 
 
@@ -1002,6 +1026,31 @@ def pagina_inicio():
             st.bar_chart(top, color="#8A63C9", horizontal=True, x_label="Turnos")
 
 
+def vista_previa_turno(t, icono, sena):
+    """Texto del turno en el calendario: una línea por dato. Se ve completo al pasar el mouse."""
+    precio = money(t["total"])
+    if t["descuento_porcentaje"]:
+        precio += f" (−{t['descuento_porcentaje']:g}%)"
+    estado = ESTADOS.get(t["estado"], (t["estado"],))[0]
+    if sena == "senado":
+        estado += f" · 💰 Señado {money(t['sena_monto'])}"
+    elif sena:
+        falta = sena_requerida(t["total"]) - t["sena_monto"]
+        estado += f" · {SENA_ESTADOS[sena][2]} {SENA_ESTADOS[sena][0]} (falta {money(falta)})"
+    lineas = [
+        f"{icono}{t['nombre']} {t['apellido']}",
+        t["servicios"] or "Turno",
+        f"👤 {t['profesional'] or SIN_ASIGNAR} · {precio}",
+        estado,
+    ]
+    if t["telefono"]:
+        lineas.append(f"📞 {t['telefono']}")
+    if t["notas"]:
+        nota = " ".join(t["notas"].split())
+        lineas.append(f"📝 {nota[:90]}{'…' if len(nota) > 90 else ''}")
+    return "\n".join(lineas)
+
+
 def pagina_agenda():
     st.title("📅 Agenda")
     ss.setdefault("cal_key", 0)
@@ -1046,10 +1095,9 @@ def pagina_agenda():
             color = color_profesional(t["profesional_id"])
         sena = estado_sena(t["total"], t["sena_monto"]) if t["estado"] in PENDIENTES else None
         icono = SENA_ESTADOS[sena][2] + " " if sena else ""
-        quien = (t["profesional"] or SIN_ASIGNAR).split()[0]
         eventos.append({
             "id": str(t["id"]),
-            "title": f"{icono}{t['nombre']} {t['apellido']} · {t['servicios'] or 'Turno'} · 👤 {quien}",
+            "title": vista_previa_turno(t, icono, sena),
             "start": t["inicio"].isoformat(),
             "end": t["fin"].isoformat(),
             "backgroundColor": color,
