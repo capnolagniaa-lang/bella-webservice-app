@@ -340,6 +340,19 @@ def datos_descuento(precio_lista, total):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def q_gastos():
+    rows = db.fetch("SELECT id, concepto, monto, activo, notas FROM gastos_fijos ORDER BY monto DESC, concepto")
+    for r in rows:
+        r["monto"] = float(r["monto"])
+    return rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def q_fechas():
+    return db.fetch("SELECT id, fecha, titulo, anual, notas FROM fechas_especiales ORDER BY fecha")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def q_profesionales():
     return db.fetch("SELECT id, nombre, activo FROM profesionales ORDER BY nombre")
 
@@ -939,6 +952,8 @@ def pagina_inicio():
     nuevos = (clientes["creado_en"] >= mes_ini).sum()
     sin_sena = df[df["falta_sena"] & (df["fin"] >= pd.Timestamp(hoy))].sort_values("inicio")
 
+    panel_fechas_especiales(df)
+
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Turnos hoy", len(de_hoy))
     k2.metric("Turnos esta semana", len(de_semana))
@@ -949,6 +964,8 @@ def pagina_inicio():
     k6.metric("Ausentismo (90 días)", f"{ausentismo:.0f}%",
               help="Turnos marcados como ausente sobre el total de turnos cerrados. Los recordatorios por "
                    "WhatsApp 24 h antes y la seña son las formas más efectivas de bajarlo.")
+
+    panel_gastos_fijos(df)
 
     if not sin_sena.empty:
         with st.container(border=True):
@@ -1553,7 +1570,7 @@ def pagina_marketing():
     contactables = clientes[clientes["acepta_mensajes"].fillna(True).astype(bool) & clientes["telefono"].notna()]
     hoy = ahora()
 
-    tab_seg, tab_origen, tab_conf = st.tabs(["🎯 Segmentos", "📈 Canales", "⚙️ Configuración"])
+    tab_seg, tab_origen = st.tabs(["🎯 Segmentos", "📈 Canales"])
     with tab_seg:
         segmentos = {
             "💤 Para reactivar": "Vinieron alguna vez, hace tiempo que no vuelven y no tienen turno agendado.",
@@ -1623,30 +1640,6 @@ def pagina_marketing():
         else:
             st.info("Cargá el campo **¿Cómo nos conoció?** en la ficha de cada cliente para ver qué canales funcionan mejor.")
 
-    with tab_conf:
-        cfg = q_config()
-        with st.form("config_marketing"):
-            c1, c2 = st.columns(2)
-            negocio = c1.text_input("Nombre del negocio", cfg["negocio"])
-            resena = c2.text_input("Link para dejar reseña en Google", cfg["link_resena"],
-                                   placeholder="https://g.page/r/…")
-            st.markdown("**💰 Seña**")
-            c1, c2 = st.columns([1, 3])
-            porcentaje = c1.number_input("Porcentaje de seña (%)", 0, 100, int(porcentaje_sena()), step=5,
-                                         help="Se calcula sobre el precio final del turno. 0 = no se pide seña.")
-            datos_pago = c2.text_input("Datos para transferir la seña", cfg["datos_pago"],
-                                       placeholder="Alias: bella.estetica.mp · Titular: … · CBU: …",
-                                       help="Se incluye en el mensaje de WhatsApp para pedir la seña.")
-            st.markdown("**✉️ Plantillas de mensajes**")
-            st.caption("Variables disponibles: {nombre}, {negocio}, {fecha}, {hora}, {servicios}, {sena}, "
-                       "{datos_pago}, {link_resena}")
-            textos = {clave: st.text_area(titulo, cfg[clave], height=90) for clave, titulo in PLANTILLAS.items()}
-            if st.form_submit_button("💾 Guardar configuración", type="primary"):
-                guardar_config({"negocio": negocio.strip() or "Bella", "link_resena": resena.strip(),
-                                "sena_porcentaje": str(int(porcentaje)), "datos_pago": datos_pago.strip(), **textos})
-                st.cache_data.clear()
-                flash("Configuración guardada")
-                st.rerun()
 
 
 def pendientes():
@@ -1665,7 +1658,7 @@ def pendientes():
          "y elegí quién los atiende, así la app puede controlar las superposiciones."
          if sin_profesional else "Todos los turnos pendientes tienen profesional."),
         (bool(cfg["clave_hash"]), "Poner contraseña a la app",
-         "Hoy cualquiera con el link ve clientes e historias clínicas. Configurala más abajo en esta página."),
+         "Hoy cualquiera con el link ve clientes e historias clínicas. Configurala en ⚙️ Configuración → 🔒 Contraseña."),
         (False, "Proteger la base de datos",
          "El repositorio de GitHub es público y tiene la contraseña de la base en `db.py`. Pasalo a privado "
          "(GitHub → Settings → Change visibility) o mové la URL a un *secret* y cambiá la contraseña en Render."),
@@ -1680,9 +1673,13 @@ def pendientes():
         (not todos_60, "Ajustar duraciones de los tratamientos",
          "Todos duran 60 min (valor por defecto). Con la duración real, la agenda calcula bien el fin de cada turno."),
         (bool(cfg["datos_pago"]), "Cargar los datos para transferir la seña",
-         "Marketing → ⚙️ Configuración. Alias o CBU que se incluye en el mensaje de WhatsApp para pedir la seña."),
+         "⚙️ Configuración → 🏪 Negocio y seña. Alias o CBU que se incluye en el mensaje de WhatsApp para pedir la seña."),
         (bool(cfg["link_resena"]), "Cargar el link de reseñas de Google",
-         "Marketing → ⚙️ Configuración. Se usa en el mensaje que se manda después de cada turno completado."),
+         "⚙️ Configuración → 🏪 Negocio y seña. Se usa en el mensaje que se manda después de cada turno completado."),
+        (bool([g for g in q_gastos() if g["activo"]]), "Cargar los gastos fijos del mes",
+         "⚙️ Configuración → 💸 Gastos fijos. Con eso Inicio te muestra si la facturación del mes los cubre."),
+        (bool(q_fechas()), "Cargar fechas especiales",
+         "⚙️ Configuración → 🎉 Fechas especiales (hay un botón para cargar las fechas típicas)."),
         (sin_origen == 0, "Registrar cómo te conoció cada cliente",
          f"{sin_origen} clientes sin dato. Con eso sabés qué canal de publicidad te trae más facturación."),
         (sin_tel == 0, "Completar teléfonos", f"{sin_tel} clientes sin WhatsApp: no pueden recibir recordatorios."),
@@ -1693,8 +1690,7 @@ def pagina_instrucciones():
     st.title("📖 Instrucciones")
     st.caption("Cómo funciona la aplicación, qué información guarda y qué conviene hacer a continuación.")
 
-    tab_uso, tab_datos, tab_pasos, tab_seg = st.tabs(
-        ["🧭 Cómo se usa", "🗄️ Qué se guarda", "🚀 Próximos pasos", "🔒 Contraseña"])
+    tab_uso, tab_datos, tab_pasos = st.tabs(["🧭 Cómo se usa", "🗄️ Qué se guarda", "🚀 Próximos pasos"])
 
     with tab_uso:
         st.markdown("""
@@ -1715,7 +1711,7 @@ def pagina_instrucciones():
    calcula solo (también podés ajustarlo a mano, por ejemplo para redondear). Se guardan el precio de lista,
    el porcentaje y el monto descontado. La seña se calcula sobre el precio **con** descuento.
 4. **Seña.** Todos los turnos se señan con un porcentaje del precio final (50% por defecto; se cambia en
-   *📣 Marketing → ⚙️ Configuración*):
+   *⚙️ Configuración → 🏪 Negocio y seña*):
    - Si ya la pagó al reservar, activá **"Ya pagó la seña"** en el formulario del turno.
    - Si no, el turno queda **⚠️ Sin seña**. Pedila con **💬 Pedir la seña por WhatsApp** (el mensaje incluye el
      monto y tus datos para transferir) y, cuando llegue el comprobante, abrí el turno y tocá **💰 Registrar seña**.
@@ -1745,9 +1741,18 @@ def pagina_instrucciones():
   desmarcá *Activo*; no se borra el historial). En la pestaña **👩‍⚕️ Profesionales** se cargan las personas
   que atienden, se **unifican** nombres duplicados y se ve lo facturado en el mes por cada una.
 - **📣 Marketing:** listas listas para escribir por WhatsApp (clientes que no vuelven, cumpleaños, una sola visita,
-  mejores clientes) con mensajes personalizados que editás en *⚙️ Plantillas*. En *📈 Canales* ves qué medio
-  (Instagram, recomendación, etc.) trae clientes que más gastan. En *⚙️ Configuración* se cargan el
-  porcentaje de seña, los datos para transferir y los textos de los mensajes.
+  mejores clientes) con mensajes personalizados. En *📈 Canales* ves qué medio (Instagram, recomendación, etc.)
+  trae clientes que más gastan.
+- **⚙️ Configuración:** gastos fijos del mes, fechas especiales, nombre del negocio, porcentaje de seña, datos para
+  transferir, textos de los mensajes de WhatsApp y contraseña de acceso.
+
+### Gastos fijos y fechas especiales
+- En **⚙️ Configuración → 💸 Gastos fijos** cargá lo que pagás todos los meses (alquiler, luz, sueldos, insumos
+  fijos…). En **🏠 Inicio** vas a ver cuánto de eso cubre lo **facturado** en el mes (turnos completados), cuánto
+  cubrirías con lo **agendado** y cuánto hay que facturar por día hábil para llegar.
+- En **⚙️ Configuración → 🎉 Fechas especiales** cargá fechas como Navidad o el Día de la Madre. Cuando falten
+  **60 días o menos**, **🏠 Inicio** te avisa y te propone una promoción con los tratamientos que **menos se
+  hicieron** en los últimos 90 días, con el mensaje listo para copiar y mandar.
 
 ### Historia clínica
 - **Antecedentes:** alergias, medicación, contraindicaciones, otros datos y fecha del consentimiento informado.
@@ -1770,6 +1775,8 @@ en el navegador ni en otros servicios.
 | **Tratamientos** | Nombre, precio, duración, descripción y si está activo |
 | **Profesionales** | Nombre y si está activa |
 | **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
+| **Gastos fijos** | Concepto, monto mensual, si está activo y notas |
+| **Fechas especiales** | Fecha, título, si se repite todos los años y notas |
 
 **Qué *no* se guarda:** el cobro del saldo el día del turno (solo el precio final), comprobantes de pago,
 fotos de antes/después y mensajes de WhatsApp (los mensajes se abren en tu WhatsApp y se envían desde ahí).
@@ -1802,40 +1809,310 @@ seguridad de la pestaña *🚀 Próximos pasos*.
 - **Usuarios individuales** para saber quién hizo cada cambio.
 """)
 
-    with tab_seg:
-        cfg = q_config()
-        tiene_clave = bool(cfg["clave_hash"])
-        if tiene_clave:
-            st.success("La app está protegida con contraseña.")
+def panel_gastos_fijos(df):
+    """Cuánto de los gastos fijos del mes cubre lo facturado (turnos completados) y lo agendado."""
+    gastos = [g for g in q_gastos() if g["activo"]]
+    if not gastos:
+        st.info("💸 Cargá tus **gastos fijos** en **⚙️ Configuración** para ver si la facturación del mes los cubre.")
+        return
+    hoy = ahora()
+    total_gastos = sum(g["monto"] for g in gastos)
+    mes_ini = pd.Timestamp(hoy.date()).replace(day=1)
+    mes_fin = mes_ini + pd.offsets.MonthBegin(1)
+    del_mes = df[(df["inicio"] >= mes_ini) & (df["inicio"] < mes_fin)]
+    facturado = float(del_mes.loc[del_mes["estado"] == "completado", "total"].sum())
+    agendado = float(del_mes.loc[del_mes["estado"].isin(PENDIENTES), "total"].sum())
+    dias_mes = (mes_fin - mes_ini).days
+    ritmo = facturado / hoy.day * dias_mes
+    # Días hábiles (lunes a sábado) que quedan en el mes, contando hoy.
+    habiles = sum(1 for d in pd.date_range(pd.Timestamp(hoy.date()), mes_fin - pd.Timedelta(days=1)) if d.weekday() < 6)
+    falta = max(0.0, total_gastos - facturado)
+    cubierto = facturado / total_gastos if total_gastos else 1.0
+    con_agenda = (facturado + agendado) / total_gastos if total_gastos else 1.0
+
+    with st.container(border=True):
+        st.subheader(f"💸 Gastos fijos de {MESES[hoy.month - 1]}")
+        st.progress(min(cubierto, 1.0),
+                    text=f"Facturado {money(facturado)} de {money(total_gastos)} ({cubierto:.0%} cubierto)")
+        if facturado >= total_gastos:
+            st.success(f"🎉 **Gastos fijos cubiertos.** Lo facturado supera los gastos por {money(facturado - total_gastos)}.")
+        elif facturado + agendado >= total_gastos:
+            st.info(f"🟡 **Vas bien:** faltan {money(falta)}, y con los turnos agendados del mes llegarías al "
+                    f"**{con_agenda:.0%}**. Asegurate de que se concreten (seña y recordatorio).")
         else:
-            st.warning("La app **no tiene contraseña**: cualquiera con el link puede ver y modificar los datos.")
-        with st.form("clave_acceso", clear_on_submit=True):
-            actual = st.text_input("Contraseña actual", type="password") if tiene_clave else ""
-            nueva = st.text_input("Nueva contraseña", type="password", help="Mínimo 8 caracteres.")
-            repetir = st.text_input("Repetir nueva contraseña", type="password")
-            c1, c2 = st.columns(2)
-            guardar = c1.form_submit_button("💾 Guardar contraseña", type="primary", width="stretch")
-            quitar = c2.form_submit_button("Quitar contraseña", width="stretch", disabled=not tiene_clave)
-            if guardar or quitar:
-                if tiene_clave and not clave_valida(actual, cfg["clave_hash"]):
-                    st.error("La contraseña actual no es correcta.")
-                elif quitar:
-                    guardar_config({"clave_hash": ""})
-                    st.cache_data.clear()
-                    flash("Contraseña quitada", "🔓")
-                    st.rerun()
-                elif len(nueva) < 8:
-                    st.error("La nueva contraseña debe tener al menos 8 caracteres.")
-                elif nueva != repetir:
-                    st.error("Las contraseñas no coinciden.")
+            por_dia = falta / habiles if habiles else falta
+            st.warning(f"🔴 **Faltan {money(falta)}** para cubrir los gastos fijos. Con lo agendado llegás al "
+                       f"**{con_agenda:.0%}**. Hay que facturar unos **{money(por_dia)} por día hábil** en los "
+                       f"{habiles} días que quedan. Ideas: reactivar clientes (📣 Marketing) o una promo de tratamientos "
+                       "con poca salida.")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Gastos fijos del mes", money(total_gastos))
+        k2.metric("Facturado (completados)", money(facturado))
+        k3.metric("Agendado (pendientes)", money(agendado))
+        k4.metric("Proyección a este ritmo", money(ritmo),
+                  help="Lo facturado hasta hoy llevado a todo el mes. Al principio del mes es poco confiable.")
+
+
+def proximas_fechas_especiales(dias=60):
+    """[(fecha, días que faltan, registro)] de las fechas especiales dentro de los próximos `dias`."""
+    hoy = ahora().date()
+    proximas = []
+    for f in q_fechas():
+        fecha = f["fecha"]
+        if f["anual"]:
+            try:
+                fecha = fecha.replace(year=hoy.year)
+            except ValueError:  # 29 de febrero en año no bisiesto
+                fecha = fecha.replace(year=hoy.year, day=28)
+            if fecha < hoy:
+                try:
+                    fecha = fecha.replace(year=hoy.year + 1)
+                except ValueError:
+                    fecha = fecha.replace(year=hoy.year + 1, day=28)
+        faltan = (fecha - hoy).days
+        if 0 <= faltan <= dias:
+            proximas.append((fecha, faltan, f))
+    return sorted(proximas, key=lambda x: x[0])
+
+
+def tratamientos_menos_pedidos(df, cantidad=3):
+    """Tratamientos activos con precio que menos se hicieron en los últimos 90 días: [(tratamiento, veces)]."""
+    desde = pd.Timestamp(ahora().date()) - pd.Timedelta(days=90)
+    recientes = df[(df["estado"] != "cancelado") & (df["inicio"] >= desde)]
+    veces = (recientes["servicios"].dropna().str.split(r",\s*").explode().str.strip().str.lower().value_counts())
+    candidatos = [t for t in q_tratamientos() if t["activo"] and t["precio"] > 0]
+    ranking = sorted(candidatos, key=lambda t: (int(veces.get(t["nombre"].strip().lower(), 0)), -t["precio"]))
+    return [(t, int(veces.get(t["nombre"].strip().lower(), 0))) for t in ranking[:cantidad]]
+
+
+def panel_fechas_especiales(df):
+    proximas = proximas_fechas_especiales()
+    if not proximas:
+        return
+    sugeridos = tratamientos_menos_pedidos(df)
+    negocio = q_config()["negocio"]
+    with st.container(border=True):
+        st.subheader("🎉 Fechas especiales en los próximos 60 días")
+        for fecha, faltan, f in proximas:
+            cuando = "¡es hoy!" if faltan == 0 else ("mañana" if faltan == 1 else f"faltan {faltan} días")
+            lanzar = fecha - timedelta(days=21)
+            lanzamiento = ("lanzala **ya**" if lanzar <= ahora().date()
+                           else f"ideal lanzarla el **{lanzar:%d/%m}** (3 semanas antes)")
+            with st.expander(f"**{f['titulo']}** · {fecha_larga(datetime.combine(fecha, datetime.min.time()))} "
+                             f"({cuando})", expanded=faltan <= 30):
+                if f["notas"]:
+                    st.caption(f["notas"])
+                if not sugeridos:
+                    st.caption("Cargá precios en 💄 Tratamientos para recibir sugerencias de promociones.")
+                    continue
+                porcentaje = 20 if sugeridos[0][1] == 0 else 15
+                nombres = [t["nombre"] for t, _ in sugeridos]
+                lista = ", ".join(nombres[:-1]) + f" y {nombres[-1]}" if len(nombres) > 1 else nombres[0]
+                st.markdown(f"💡 **Promo sugerida — {f['titulo']}: {porcentaje}% OFF en {lista}**  \n"
+                            f"Son los tratamientos que menos salieron en los últimos 90 días; {lanzamiento}.")
+                filas = [f"- {t['nombre']}: {money(t['precio'])} → **{money(aplicar_descuento(t['precio'], porcentaje))}** "
+                         f"<span class='muted'>(se hizo {veces} {'vez' if veces == 1 else 'veces'})</span>"
+                         for t, veces in sugeridos]
+                st.markdown("\n".join(filas), unsafe_allow_html=True)
+                st.caption("Mensaje listo para copiar (ícono de copiar a la derecha) y mandar por WhatsApp o Instagram:")
+                st.code(f"✨ ¡Se viene {f['titulo']}! ✨\nEn {negocio} te esperamos con {porcentaje}% OFF en {lista} "
+                        f"hasta el {fecha:%d/%m}. 💖\nReservá tu turno respondiendo este mensaje.",
+                        language=None, wrap_lines=True)
+                st.caption(f"Al agendar, cargá **{porcentaje}%** en *Descuento (%)*. Para elegir a quién mandarlo, "
+                           "usá los segmentos de 📣 Marketing.")
+
+
+FECHAS_SUGERIDAS = [
+    ((2, 14), "San Valentín"), ((3, 8), "Día de la Mujer"), ((7, 20), "Día del Amigo"),
+    ((9, 21), "Día de la Primavera"), ((12, 25), "Navidad"), ((12, 31), "Fin de año"),
+]
+
+
+def tercer_domingo(anio, mes):
+    primero = date(anio, mes, 1)
+    return primero + timedelta(days=(6 - primero.weekday()) % 7 + 14)
+
+
+def config_gastos():
+    st.caption("Cargá lo que pagás **todos los meses** (alquiler, servicios, sueldos, monotributo, insumos fijos…). "
+               "En 🏠 Inicio vas a ver cuánto de eso cubre la facturación del mes. Desmarcá *Activo* para dejar de "
+               "contar un gasto sin borrarlo.")
+    original = pd.DataFrame(q_gastos(), columns=["id", "concepto", "monto", "activo", "notas"])
+    editado = st.data_editor(
+        original, num_rows="dynamic", hide_index=True, width="stretch", key="editor_gastos",
+        column_config={
+            "id": None,
+            "concepto": st.column_config.TextColumn("Concepto", required=True, help="Ej.: Alquiler, Luz, Sueldos"),
+            "monto": st.column_config.NumberColumn("Monto mensual", min_value=0, step=1000, format="$%.0f",
+                                                   required=True),
+            "activo": st.column_config.CheckboxColumn("Activo", default=True),
+            "notas": st.column_config.TextColumn("Notas"),
+        },
+    )
+    activos = editado[editado["activo"].fillna(True).astype(bool)]
+    st.metric("Total de gastos fijos mensuales", money(pd.to_numeric(activos["monto"], errors="coerce").fillna(0).sum()))
+    if st.button("💾 Guardar gastos", type="primary"):
+        ids = set()
+        with db.transaction() as cur:
+            for _, g in editado.iterrows():
+                concepto = g["concepto"].strip() if isinstance(g["concepto"], str) else ""
+                if not concepto:
+                    continue
+                valores = (concepto, float(g["monto"]) if pd.notna(g["monto"]) else 0.0,
+                           bool(g["activo"]) if pd.notna(g["activo"]) else True,
+                           g["notas"].strip() if isinstance(g["notas"], str) and g["notas"].strip() else None)
+                if pd.isna(g["id"]):
+                    cur.execute("INSERT INTO gastos_fijos (concepto, monto, activo, notas) VALUES (%s, %s, %s, %s)",
+                                valores)
                 else:
-                    guardar_config({"clave_hash": hash_clave(nueva)})
-                    st.cache_data.clear()
-                    ss.autenticado = True
-                    flash("Contraseña guardada", "🔒")
-                    st.rerun()
-        st.caption("La contraseña se guarda cifrada. Si la olvidás, se puede borrar desde la base de datos "
-                   "(tabla `configuracion`, clave `clave_hash`).")
+                    ids.add(int(g["id"]))
+                    cur.execute("UPDATE gastos_fijos SET concepto=%s, monto=%s, activo=%s, notas=%s WHERE id=%s",
+                                (*valores, int(g["id"])))
+            for borrado in set(original["id"].astype(int)) - ids:
+                cur.execute("DELETE FROM gastos_fijos WHERE id = %s", (borrado,))
+        invalidar()
+        flash("Gastos fijos guardados")
+        st.rerun()
+
+
+def config_fechas():
+    st.caption("Fechas importantes para tus clientes. Cuando falten 60 días o menos, 🏠 Inicio te avisa y te "
+               "propone una promoción. Marcá **Todos los años** para las fechas fijas (Navidad); dejala sin marcar "
+               "para las que cambian de día (Día de la Madre) o eventos puntuales.")
+    original = pd.DataFrame(q_fechas(), columns=["id", "fecha", "titulo", "anual", "notas"])
+    original["fecha"] = pd.to_datetime(original["fecha"])
+    editado = st.data_editor(
+        original, num_rows="dynamic", hide_index=True, width="stretch", key="editor_fechas",
+        column_config={
+            "id": None,
+            "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY", required=True),
+            "titulo": st.column_config.TextColumn("Título", required=True, help="Ej.: Navidad, Día de la Madre"),
+            "anual": st.column_config.CheckboxColumn("Todos los años", default=True),
+            "notas": st.column_config.TextColumn("Notas / ideas"),
+        },
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Guardar fechas", type="primary", width="stretch"):
+        ids = set()
+        with db.transaction() as cur:
+            for _, f in editado.iterrows():
+                titulo = f["titulo"].strip() if isinstance(f["titulo"], str) else ""
+                if not titulo or pd.isna(f["fecha"]):
+                    continue
+                valores = (pd.Timestamp(f["fecha"]).date(), titulo,
+                           bool(f["anual"]) if pd.notna(f["anual"]) else True,
+                           f["notas"].strip() if isinstance(f["notas"], str) and f["notas"].strip() else None)
+                if pd.isna(f["id"]):
+                    cur.execute("INSERT INTO fechas_especiales (fecha, titulo, anual, notas) VALUES (%s, %s, %s, %s)",
+                                valores)
+                else:
+                    ids.add(int(f["id"]))
+                    cur.execute("UPDATE fechas_especiales SET fecha=%s, titulo=%s, anual=%s, notas=%s WHERE id=%s",
+                                (*valores, int(f["id"])))
+            for borrado in set(original["id"].astype(int)) - ids:
+                cur.execute("DELETE FROM fechas_especiales WHERE id = %s", (borrado,))
+        invalidar()
+        flash("Fechas especiales guardadas")
+        st.rerun()
+    if c2.button("✨ Cargar fechas típicas", width="stretch",
+                 help="San Valentín, Día de la Mujer, Día del Amigo, Primavera, Navidad, Fin de año, "
+                      "Día de la Madre y Día del Padre (las que no estén cargadas)."):
+        hoy = ahora().date()
+        existentes = {f["titulo"].strip().lower() for f in q_fechas()}
+        nuevas = [(date(2000, m, d), titulo, True) for (m, d), titulo in FECHAS_SUGERIDAS]
+        for mes, titulo in ((10, "Día de la Madre"), (6, "Día del Padre")):  # tercer domingo: cambia cada año
+            proxima = tercer_domingo(hoy.year, mes)
+            if proxima < hoy:
+                proxima = tercer_domingo(hoy.year + 1, mes)
+            nuevas.append((proxima, titulo, False))
+        agregadas = 0
+        with db.transaction() as cur:
+            for fecha, titulo, anual in nuevas:
+                if titulo.lower() not in existentes:
+                    cur.execute("INSERT INTO fechas_especiales (fecha, titulo, anual, notas) VALUES (%s, %s, %s, %s)",
+                                (fecha, titulo, anual, None if anual else "Cambia de día cada año: actualizala."))
+                    agregadas += 1
+        invalidar()
+        flash(f"{agregadas} fecha(s) agregadas" if agregadas else "Las fechas típicas ya estaban cargadas")
+        st.rerun()
+
+
+def config_negocio():
+    cfg = q_config()
+    with st.form("config_negocio"):
+        c1, c2 = st.columns(2)
+        negocio = c1.text_input("Nombre del negocio", cfg["negocio"])
+        resena = c2.text_input("Link para dejar reseña en Google", cfg["link_resena"], placeholder="https://g.page/r/…")
+        st.markdown("**💰 Seña**")
+        c1, c2 = st.columns([1, 3])
+        porcentaje = c1.number_input("Porcentaje de seña (%)", 0, 100, int(porcentaje_sena()), step=5,
+                                     help="Se calcula sobre el precio final del turno. 0 = no se pide seña.")
+        datos_pago = c2.text_input("Datos para transferir la seña", cfg["datos_pago"],
+                                   placeholder="Alias: bella.estetica.mp · Titular: … · CBU: …",
+                                   help="Se incluye en el mensaje de WhatsApp para pedir la seña.")
+        if st.form_submit_button("💾 Guardar", type="primary"):
+            guardar_config({"negocio": negocio.strip() or "Bella", "link_resena": resena.strip(),
+                            "sena_porcentaje": str(int(porcentaje)), "datos_pago": datos_pago.strip()})
+            st.cache_data.clear()
+            flash("Configuración guardada")
+            st.rerun()
+
+
+def config_mensajes():
+    cfg = q_config()
+    with st.form("config_mensajes"):
+        st.caption("Textos de los mensajes de WhatsApp. Variables disponibles: {nombre}, {negocio}, {fecha}, {hora}, "
+                   "{servicios}, {sena}, {datos_pago}, {link_resena}")
+        textos = {clave: st.text_area(titulo, cfg[clave], height=90) for clave, titulo in PLANTILLAS.items()}
+        if st.form_submit_button("💾 Guardar mensajes", type="primary"):
+            guardar_config(textos)
+            st.cache_data.clear()
+            flash("Mensajes guardados")
+            st.rerun()
+
+
+def config_contrasena():
+    cfg = q_config()
+    tiene_clave = bool(cfg["clave_hash"])
+    if tiene_clave:
+        st.success("La app está protegida con contraseña.")
+    else:
+        st.warning("La app **no tiene contraseña**: cualquiera con el link puede ver y modificar los datos.")
+    with st.form("clave_acceso", clear_on_submit=True):
+        actual = st.text_input("Contraseña actual", type="password") if tiene_clave else ""
+        nueva = st.text_input("Nueva contraseña", type="password", help="Mínimo 8 caracteres.")
+        repetir = st.text_input("Repetir nueva contraseña", type="password")
+        c1, c2 = st.columns(2)
+        guardar = c1.form_submit_button("💾 Guardar contraseña", type="primary", width="stretch")
+        quitar = c2.form_submit_button("Quitar contraseña", width="stretch", disabled=not tiene_clave)
+        if guardar or quitar:
+            if tiene_clave and not clave_valida(actual, cfg["clave_hash"]):
+                st.error("La contraseña actual no es correcta.")
+            elif quitar:
+                guardar_config({"clave_hash": ""})
+                st.cache_data.clear()
+                flash("Contraseña quitada", "🔓")
+                st.rerun()
+            elif len(nueva) < 8:
+                st.error("La nueva contraseña debe tener al menos 8 caracteres.")
+            elif nueva != repetir:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                guardar_config({"clave_hash": hash_clave(nueva)})
+                st.cache_data.clear()
+                ss.autenticado = True
+                flash("Contraseña guardada", "🔒")
+                st.rerun()
+    st.caption("La contraseña se guarda cifrada. Si la olvidás, se puede borrar desde la base de datos "
+               "(tabla `configuracion`, clave `clave_hash`).")
+
+
+def pagina_configuracion():
+    st.title("⚙️ Configuración")
+    tabs = st.tabs(["💸 Gastos fijos", "🎉 Fechas especiales", "🏪 Negocio y seña", "✉️ Mensajes", "🔒 Contraseña"])
+    for tab, seccion in zip(tabs, (config_gastos, config_fechas, config_negocio, config_mensajes, config_contrasena)):
+        with tab:
+            seccion()
 
 
 # --------------------------------------------------------------------------- arranque
@@ -1847,6 +2124,7 @@ PAGINAS = {
     "💄 Tratamientos": pagina_tratamientos,
     "📣 Marketing": pagina_marketing,
     "📖 Instrucciones": pagina_instrucciones,
+    "⚙️ Configuración": pagina_configuracion,
 }
 
 try:
@@ -1910,7 +2188,7 @@ with st.sidebar:
             ss.autenticado = False
             st.rerun()
     else:
-        st.caption("⚠️ La app no tiene contraseña. Configurala en 📖 Instrucciones → 🔒 Contraseña.")
+        st.caption("⚠️ La app no tiene contraseña. Configurala en ⚙️ Configuración → 🔒 Contraseña.")
 
 try:
     PAGINAS[pagina]()

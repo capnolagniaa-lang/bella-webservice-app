@@ -224,6 +224,19 @@ _MIGRATIONS = [
     "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS precio_lista NUMERIC(12,2)",
     "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS descuento_porcentaje NUMERIC(5,2)",
     "ALTER TABLE turnos ADD COLUMN IF NOT EXISTS descuento_monto NUMERIC(12,2)",
+    # Configuración: gastos fijos mensuales y fechas especiales para campañas.
+    """CREATE TABLE IF NOT EXISTS gastos_fijos (
+        id SERIAL PRIMARY KEY,
+        concepto TEXT NOT NULL,
+        monto NUMERIC(12,2) NOT NULL CHECK (monto >= 0),
+        activo BOOLEAN NOT NULL DEFAULT TRUE,
+        notas TEXT)""",
+    """CREATE TABLE IF NOT EXISTS fechas_especiales (
+        id SERIAL PRIMARY KEY,
+        fecha DATE NOT NULL,
+        titulo TEXT NOT NULL,
+        anual BOOLEAN NOT NULL DEFAULT TRUE,
+        notas TEXT)""",
     # Se descartó el catálogo de descuentos (nunca llegó a usarse).
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_id",
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_nombre",
