@@ -539,13 +539,20 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
                     index=0 if clientes else 1, label_visibility="collapsed")
     if modo == "Existente":
         ids = list(clientes)
+        proximos = proximos_turnos()
         cli_id = st.selectbox(
             "Cliente", ids, index=ids.index(cliente_id) if cliente_id in clientes else None,
-            format_func=lambda i: f"{clientes[i]['nombre']} {clientes[i]['apellido']} · {clientes[i]['telefono'] or 's/tel'}",
+            format_func=lambda i: f"{clientes[i]['nombre']} {clientes[i]['apellido']} · "
+                                  f"{clientes[i]['telefono'] or 's/tel'}{etiqueta_proximo(proximos.get(i))}",
             placeholder="Buscá por nombre, apellido o teléfono…",
         )
         if cli_id:
             alerta_antecedentes(cli_id)
+            if proximos.get(cli_id):
+                detalle = "  \n".join(f"• {fecha_larga(t['inicio']).capitalize()} {t['inicio']:%H:%M} — "
+                                      f"{t['servicios'] or 'Turno'} con {t['profesional'] or SIN_ASIGNAR}"
+                                      for t in proximos[cli_id])
+                st.info(f"📅 **Ya tiene {len(proximos[cli_id])} turno(s) próximo(s):**  \n{detalle}")
         nuevo = None
     else:
         cli_id = None
@@ -1285,6 +1292,39 @@ def historia_clinica(cliente_id, nombre_cliente):
             st.markdown(e["texto"])
 
 
+DIAS_CORTOS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+
+def proximos_turnos():
+    """{cliente_id: [turnos reservados/confirmados que todavía no terminaron, del más cercano al más lejano]}."""
+    momento = ahora()
+    por_cliente = {}
+    for t in q_turnos():  # ya vienen ordenados por fecha
+        if t["estado"] in PENDIENTES and t["fin"] >= momento:
+            por_cliente.setdefault(t["cliente_id"], []).append(t)
+    return por_cliente
+
+
+def etiqueta_proximo(turnos):
+    """Texto corto para el buscador: «📅 jue 23/10 10:00 (+1)»."""
+    if not turnos:
+        return ""
+    t = turnos[0]
+    extra = f" (+{len(turnos) - 1})" if len(turnos) > 1 else ""
+    return f" · 📅 {DIAS_CORTOS[t['inicio'].weekday()]} {t['inicio']:%d/%m %H:%M}{extra}"
+
+
+def lista_proximos_turnos(turnos, prefijo):
+    for t in turnos:
+        c1, c2, c3, c4 = st.columns([2.2, 4, 2, 0.8], vertical_alignment="center")
+        c1.markdown(f"**{fecha_larga(t['inicio']).capitalize()}**  \n{t['inicio']:%H:%M} a {t['fin']:%H:%M} hs")
+        c2.markdown(f"{t['servicios'] or 'Turno'}  \n<span class='muted'>👤 {t['profesional'] or SIN_ASIGNAR} · "
+                    f"{money(t['total'])}</span>", unsafe_allow_html=True)
+        c3.markdown(f"{chip(t['estado'])}<br>{chip_sena(t['total'], t['sena_monto'])}", unsafe_allow_html=True)
+        if c4.button("🔍", key=f"{prefijo}_{t['id']}", help="Abrir turno", width="stretch"):
+            abrir_dialogo("turno", turno_id=int(t["id"]))
+
+
 def ficha_cliente(c, turnos):
     st.button("← Volver al listado", on_click=lambda: ss.update(cliente_sel=None))
     edad = c["edad"]
@@ -1305,6 +1345,14 @@ def ficha_cliente(c, turnos):
     url = link_wa(c["telefono"], f"¡Hola {c['nombre']}! ")
     if url:
         b2.link_button("💬 Abrir WhatsApp", url, width="stretch")
+
+    proximos = proximos_turnos().get(int(c["id"]), [])
+    if proximos:
+        with st.container(border=True):
+            st.markdown(f"**📅 Próximos turnos ({len(proximos)})**")
+            lista_proximos_turnos(proximos, f"ficha_prox_{c['id']}")
+    else:
+        st.caption("📅 No tiene turnos próximos.")
 
     tab_datos, tab_hc, tab_turnos = st.tabs(["Datos", "Historia clínica", "Turnos"])
     with tab_datos, st.form(f"cliente_{c['id']}"):
@@ -1399,12 +1447,17 @@ def pagina_clientes():
 
     if clientes.empty:
         return
-    nombres = dict(zip(clientes["id"].astype(int).tolist(),
-                       clientes["apellido"] + ", " + clientes["nombre"] + " · " + clientes["telefono"].fillna("s/tel")))
+    proximos = proximos_turnos()
+    nombres = {int(c["id"]): f"{c['apellido']}, {c['nombre']} · "
+                             f"{c['telefono'] if isinstance(c['telefono'], str) and c['telefono'] else 's/tel'}"
+                             f"{etiqueta_proximo(proximos.get(int(c['id'])))}"
+               for _, c in clientes.iterrows()}
     if ss.get("cliente_sel") not in nombres:
         ss.cliente_sel = None
     st.selectbox("Abrir ficha", list(nombres), index=None, format_func=nombres.get, key="cliente_sel",
                  placeholder="🔎 Buscá por nombre, apellido o teléfono…", label_visibility="collapsed")
+    st.caption(f"📅 = tiene turno próximo (fecha del más cercano; «+N» si tiene más). "
+               f"{len(proximos)} clientes con turnos próximos.")
 
     if ss.cliente_sel is not None:
         ficha_cliente(clientes.set_index("id", drop=False).loc[ss.cliente_sel], df_turnos())
