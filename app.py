@@ -1,6 +1,7 @@
 import functools
 import hashlib
 import hmac
+import html
 import inspect
 import re
 import secrets
@@ -47,6 +48,7 @@ CONFIG_DEFAULT = {
     "clave_hash": "",
     "sena_porcentaje": "50",
     "datos_pago": "",
+    "whatsapp_modo": "auto",
     "tpl_sena": (
         "¡Hola {nombre}! 💖 Para confirmar tu turno en {negocio} del {fecha} a las {hora} hs ({servicios}) "
         "te pedimos una seña de {sena}. {datos_pago} Cuando la envíes, mandanos el comprobante por acá 🙌"
@@ -89,6 +91,10 @@ st.markdown(
     .chip {display:inline-block; padding:2px 10px; border-radius:999px; color:#fff; font-size:.8rem;
         font-weight:600; margin-right:6px;}
     .muted {opacity:.7; font-size:.9rem;}
+    a.wa-btn {display:block; text-align:center; padding:.42rem .6rem; border:1px solid rgba(49,51,63,.2);
+        border-radius:.5rem; text-decoration:none !important; color:inherit !important; font-size:.92rem;
+        background:transparent; line-height:1.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+    a.wa-btn:hover {border-color:#25D366; color:#128C7E !important;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -188,9 +194,30 @@ def telefono_wa(telefono):
     return digits
 
 
+MODOS_WHATSAPP = {
+    "app": "App de WhatsApp instalada en la PC o el celular (recomendado: no abre pestañas)",
+    "web": "WhatsApp Web (abre una pestaña nueva por cada mensaje)",
+    "auto": "Automático, wa.me (en el celular abre la app; en la PC pasa por una página intermedia)",
+}
+
+
 def link_wa(telefono, texto):
     numero = telefono_wa(telefono)
-    return f"https://wa.me/{numero}?text={quote(texto)}" if numero else None
+    if not numero:
+        return None
+    modo = q_config().get("whatsapp_modo")
+    if modo == "app":
+        return f"whatsapp://send?phone={numero}&text={quote(texto)}"
+    if modo == "web":
+        return f"https://web.whatsapp.com/send?phone={numero}&text={quote(texto)}"
+    return f"https://wa.me/{numero}?text={quote(texto)}"
+
+
+def boton_wa(destino, etiqueta, url, ayuda="Abrir el chat en WhatsApp con el mensaje listo"):
+    """Botón de WhatsApp. El link de la app (whatsapp://) se abre sin crear una pestaña vacía."""
+    destino_link = "_self" if url.startswith("whatsapp:") else "_blank"
+    destino.markdown(f'<a class="wa-btn" href="{html.escape(url)}" target="{destino_link}" rel="noopener" '
+                     f'title="{html.escape(ayuda)}">{html.escape(etiqueta)}</a>', unsafe_allow_html=True)
 
 
 class _SafeDict(dict):
@@ -803,7 +830,7 @@ def dialogo_turno(turno_id):
     c1, c2, c3, c4 = st.columns(4)
     url = link_wa(t["telefono"], mensaje("tpl_recordatorio", **datos_turno_msg(t)))
     if url:
-        c1.link_button("💬 Recordatorio", url, width="stretch")
+        boton_wa(c1, "💬 Recordatorio", url)
     else:
         c1.caption("Sin teléfono cargado")
     if t["estado"] in PENDIENTES:
@@ -1081,7 +1108,7 @@ def seccion_sena(t):
         if estado != "senado" and not completado:
             url = link_wa(t["telefono"], mensaje("tpl_sena", **datos_turno_msg(t)))
             if url:
-                st.link_button("💬 Pedir la seña por WhatsApp", url)
+                boton_wa(st, "💬 Pedir la seña por WhatsApp", url)
         pagos = db.fetch("SELECT fecha, monto, medio, tipo FROM pagos WHERE turno_id = %s ORDER BY fecha, id",
                          (turno_id,))
         if pagos:
@@ -1133,7 +1160,7 @@ def fila_turno(t, prefijo, acciones=True, plantilla="tpl_recordatorio", con_fech
     b1, b2, b3 = c4.columns(3)
     url = link_wa(t["telefono"], mensaje(plantilla, **datos_turno_msg(t)))
     if url:
-        b1.link_button("💬", url, help="Enviar WhatsApp", width="stretch")
+        boton_wa(b1, "💬", url, "Enviar WhatsApp")
     if b2.button("🔍", key=f"{prefijo}_ver_{t['id']}", help="Ver detalle", width="stretch"):
         abrir_dialogo("turno", turno_id=int(t["id"]))
     if acciones and t["estado"] == "reservado":
@@ -1605,7 +1632,7 @@ def ficha_cliente(c, turnos):
         abrir_dialogo("nuevo", cliente_id=int(c["id"]))
     url = link_wa(c["telefono"], f"¡Hola {c['nombre']}! ")
     if url:
-        b2.link_button("💬 Abrir WhatsApp", url, width="stretch")
+        boton_wa(b2, "💬 Abrir WhatsApp", url)
 
     proximos = proximos_turnos().get(int(c["id"]), [])
     if proximos:
@@ -1924,16 +1951,18 @@ def pagina_marketing():
                 for tel, nom, serv in zip(lista["telefono"], lista["nombre"], lista["ultimo_servicio"])
             ]
             st.markdown(f"**{len(lista)} clientes**")
-            st.dataframe(
-                lista[["cliente", "telefono", "visitas", "gastado", "ultima_visita", "whatsapp"]],
-                hide_index=True, width="stretch",
-                column_config={
-                    "cliente": "Cliente", "telefono": "Teléfono", "visitas": "Visitas",
-                    "gastado": st.column_config.NumberColumn("Gastado", format="$%.0f"),
-                    "ultima_visita": st.column_config.DateColumn("Última visita", format="DD/MM/YYYY"),
-                    "whatsapp": st.column_config.LinkColumn("Enviar", display_text="💬 WhatsApp"),
-                },
-            )
+            encabezado = st.columns([3, 2, 1, 1.4, 1.6, 1.6])
+            for col, titulo in zip(encabezado, ["Cliente", "Teléfono", "Visitas", "Gastado", "Última visita", ""]):
+                col.caption(titulo)
+            for _, c in lista.iterrows():
+                fila = st.columns([3, 2, 1, 1.4, 1.6, 1.6], vertical_alignment="center")
+                fila[0].markdown(c["cliente"])
+                fila[1].markdown(c["telefono"] if isinstance(c["telefono"], str) else "—")
+                fila[2].markdown(str(int(c["visitas"])))
+                fila[3].markdown(money(c["gastado"]))
+                fila[4].markdown(c["ultima_visita"].strftime("%d/%m/%Y") if pd.notna(c["ultima_visita"]) else "—")
+                if c["whatsapp"]:
+                    boton_wa(fila[5], "💬 WhatsApp", c["whatsapp"])
             st.download_button("⬇️ Descargar lista (CSV)",
                                lista[["nombre", "apellido", "telefono", "email", "visitas", "gastado"]]
                                .to_csv(index=False).encode("utf-8-sig"),
@@ -2376,9 +2405,16 @@ def config_negocio():
         datos_pago = c2.text_input("Datos para transferir la seña", cfg["datos_pago"],
                                    placeholder="Alias: bella.estetica.mp · Titular: … · CBU: …",
                                    help="Se incluye en el mensaje de WhatsApp para pedir la seña.")
+        st.markdown("**💬 WhatsApp**")
+        modos = list(MODOS_WHATSAPP)
+        modo_wa = st.radio("Abrir los mensajes en", modos, format_func=MODOS_WHATSAPP.get,
+                           index=modos.index(cfg.get("whatsapp_modo")) if cfg.get("whatsapp_modo") in modos else 0,
+                           help="WhatsApp no permite que otra página reutilice una pestaña de WhatsApp Web ya "
+                                "abierta. Con la app de escritorio instalada, cada mensaje se abre directo en el chat.")
         if st.form_submit_button("💾 Guardar", type="primary"):
             guardar_config({"negocio": negocio.strip() or "Bella", "link_resena": resena.strip(),
-                            "sena_porcentaje": str(int(porcentaje)), "datos_pago": datos_pago.strip()})
+                            "sena_porcentaje": str(int(porcentaje)), "datos_pago": datos_pago.strip(),
+                            "whatsapp_modo": modo_wa})
             st.cache_data.clear()
             flash("Configuración guardada")
             st.rerun()
