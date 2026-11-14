@@ -893,11 +893,26 @@ def dialogo_turno(turno_id):
 
     with st.expander("🗑️ Eliminar turno"):
         st.caption("Si el cliente canceló, conviene marcarlo como **Cancelado** para conservar el historial.")
+        pagado = db.fetch_one("SELECT COUNT(*) AS n, COALESCE(SUM(monto), 0) AS total FROM pagos WHERE turno_id = %s",
+                              (turno_id,))
+        borrar_pagos = True
+        if pagado and pagado["n"]:
+            st.warning(f"Este turno tiene **{pagado['n']} pago(s) registrados por {money(pagado['total'])}**. "
+                       "Si el cliente pagó y no vino, usá **🚫 Cancelar** (la seña queda registrada o pasa a saldo "
+                       "a favor). Eliminarlo solo tiene sentido si el turno y sus pagos se cargaron por error.")
+            borrar_pagos = st.checkbox("Borrar también los pagos (se cargaron por error)", key=f"del_pagos_{turno_id}",
+                                       help="Se borran de Facturación y se deshacen los movimientos de saldo a favor "
+                                            "que generaron.")
         confirmar = st.checkbox("Sí, quiero eliminarlo definitivamente", key=f"del_{turno_id}")
-        if st.button("Eliminar", disabled=not confirmar, key=f"del_btn_{turno_id}"):
-            db.execute("DELETE FROM turnos WHERE id = %s", (turno_id,))
+        if st.button("Eliminar", disabled=not (confirmar and borrar_pagos), key=f"del_btn_{turno_id}"):
+            with db.transaction() as cur:
+                cur.execute("DELETE FROM pagos WHERE turno_id = %s", (turno_id,))
+                cur.execute("DELETE FROM movimientos_saldo WHERE turno_id = %s "
+                            "AND tipo IN ('excedente_sena', 'uso_sena')", (turno_id,))
+                cur.execute("DELETE FROM turnos WHERE id = %s", (turno_id,))
             invalidar()
-            flash("Turno eliminado", "🗑️")
+            flash("Turno eliminado" + (f" junto con sus pagos ({money(pagado['total'])})"
+                                       if pagado and pagado["n"] else ""), "🗑️")
             st.rerun()
 
 
@@ -2443,6 +2458,8 @@ def q_pagos(desde, hasta):
     for r in rows:
         r["fecha"] = naive(r["fecha"])
         r["turno"] = naive(r["turno"])
+        if r["turno_id"] is None:
+            r["servicios"] = "(turno eliminado)"
         r["monto"] = float(r["monto"])
     return rows
 
