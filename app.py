@@ -812,17 +812,33 @@ def dialogo_turno(turno_id):
             if resta > 0:
                 st.markdown(f"Resta cobrar **{money(resta)}**"
                             + (f" (ya pagó {money(t['sena_monto'])})" if t["sena_monto"] else ""))
-                cobro = st.number_input("Monto cobrado ($)", 0.0, value=resta, step=500.0, key=f"cobro_{turno_id}",
+                dos_medios = st.toggle("Pagó con dos medios", key=f"dos_medios_{turno_id}",
+                                       help="Por ejemplo, una parte en efectivo y otra por transferencia.")
+                cobro = st.number_input("Monto cobrado ($)" if not dos_medios else "Primer pago ($)", 0.0,
+                                        value=resta, step=500.0, key=f"cobro_{turno_id}",
                                         help="Si cobrás de más, el excedente queda como saldo a favor del cliente.")
                 medio_cobro = st.selectbox("Medio de pago", MEDIOS_PAGO, key=f"medio_cobro_{turno_id}")
+                pagos = [(cobro, medio_cobro)]
+                if dos_medios:
+                    cobro2 = st.number_input("Segundo pago ($)", 0.0, value=max(0.0, resta - cobro), step=500.0,
+                                             help="Se completa solo con lo que falta para llegar al total.")
+                    medio2 = st.selectbox("Medio del segundo pago", MEDIOS_PAGO, index=1, key=f"medio2_{turno_id}")
+                    pagos.append((cobro2, medio2))
+                    suma = cobro + cobro2
+                    st.caption(f"Total: **{money(suma)}** de {money(resta)}"
+                               + (f" · faltan {money(resta - suma)}" if suma < resta else
+                                  f" · {money(suma - resta)} a saldo a favor" if suma > resta else " ✅"))
                 if st.button("💵 Cobrar y completar", type="primary", key=f"cobrar_{turno_id}", width="stretch"):
                     excedente = 0.0
-                    if cobro > 0:
-                        excedente = registrar_sena(turno_id, cobro, medio_cobro, "pago_turno",
-                                                   fecha_de_cobro(t["inicio"]))[1]
+                    with db.transaction() as cur:
+                        for monto, medio in pagos:
+                            if monto > 0:
+                                excedente += aplicar_pago_sena(cur, turno_id, monto, medio, "pago_turno",
+                                                               fecha_de_cobro(t["inicio"]))[1]
                     cambiar_estado([turno_id], "completado")
                     invalidar()
-                    flash(f"Turno completado. Cobro de {money(cobro)} ({medio_cobro}) registrado"
+                    detalle = " + ".join(f"{money(m)} {medio}" for m, medio in pagos if m > 0) or "sin monto"
+                    flash(f"Turno completado. Cobro registrado: {detalle}"
                           + (f"; {money(excedente)} a saldo a favor" if excedente else ""), "💵")
                     st.rerun()
                 if st.button("Completar sin registrar cobro", key=f"completar_sin_{turno_id}", width="stretch"):
