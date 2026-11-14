@@ -253,8 +253,27 @@ def mover_saldo(cur, cliente_id, monto, tipo, concepto, turno_id=None):
                 "VALUES (%s, %s, %s, %s, %s, %s)", (cliente_id, turno_id, ahora(), round(monto, 2), tipo, concepto))
 
 
-def aplicar_pago_sena(cur, turno_id, monto, medio):
-    """Suma un pago a la seña dentro de una transacción.
+TIPOS_PAGO = {
+    "sena": "Seña",
+    "pago_turno": "Pago del turno",
+    "saldo_a_favor": "A saldo a favor",
+}
+
+
+def fecha_de_cobro(inicio_turno):
+    """Un cobro registrado hoy de un turno de días anteriores se fecha el día del turno."""
+    inicio = naive(inicio_turno)
+    return inicio if inicio.date() < ahora().date() else ahora()
+
+
+def registrar_cobro(cur, fecha, cliente_id, turno_id, monto, medio, tipo, concepto=None):
+    cur.execute("INSERT INTO pagos (fecha, cliente_id, turno_id, monto, medio, tipo, concepto) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (fecha, cliente_id, turno_id, round(monto, 2), medio, tipo, concepto))
+
+
+def aplicar_pago_sena(cur, turno_id, monto, medio, tipo="sena", fecha=None):
+    """Suma un pago a la seña dentro de una transacción y lo registra en `pagos`.
 
     Lo que supera el precio del turno queda como saldo a favor del cliente. Si el pago se hace con saldo a
     favor, se descuenta del saldo (nunca más de lo que falta pagar del turno ni del saldo disponible).
@@ -264,6 +283,7 @@ def aplicar_pago_sena(cur, turno_id, monto, medio):
     cur.execute("SELECT cliente_id, total, sena_monto, estado, fecha_inicio FROM turnos WHERE id = %s FOR UPDATE",
                 (turno_id,))
     t = cur.fetchone()
+    fecha = fecha or ahora()
     total, pagado = float(t["total"] or 0), float(t["sena_monto"] or 0)
     falta_turno = max(0.0, total - pagado)
     if medio == USO_SALDO:
@@ -277,21 +297,23 @@ def aplicar_pago_sena(cur, turno_id, monto, medio):
                       sena_medio = CASE WHEN sena_medio IS NULL OR sena_medio = %s THEN %s
                                         ELSE sena_medio || ' + ' || %s END
                WHERE id = %s""",
-            (al_turno, ahora(), medio, medio, medio, turno_id),
+            (al_turno, fecha, medio, medio, medio, turno_id),
         )
+        registrar_cobro(cur, fecha, t["cliente_id"], turno_id, al_turno, medio, tipo)
         if medio == USO_SALDO:
             mover_saldo(cur, t["cliente_id"], -al_turno, "uso_sena", f"Usado como seña del turno del {cuando}", turno_id)
     if excedente > 0:
         mover_saldo(cur, t["cliente_id"], excedente, "excedente_sena",
                     f"Excedente de seña del turno del {cuando} ({medio})", turno_id)
+        registrar_cobro(cur, fecha, t["cliente_id"], turno_id, excedente, medio, "saldo_a_favor")
     if t["estado"] == "reservado" and estado_sena(total, pagado + al_turno) == "senado":
         cur.execute("UPDATE turnos SET estado = 'confirmado' WHERE id = %s", (turno_id,))
     return al_turno, excedente
 
 
-def registrar_sena(turno_id, monto, medio):
+def registrar_sena(turno_id, monto, medio, tipo="sena", fecha=None):
     with db.transaction() as cur:
-        return aplicar_pago_sena(cur, turno_id, monto, medio)
+        return aplicar_pago_sena(cur, turno_id, monto, medio, tipo, fecha)
 
 
 def texto_pago(al_turno, excedente):
@@ -784,11 +806,37 @@ def dialogo_turno(turno_id):
         c1.link_button("💬 Recordatorio", url, width="stretch")
     else:
         c1.caption("Sin teléfono cargado")
-    if t["estado"] in PENDIENTES and c2.button("✅ Completado", width="stretch"):
-        cambiar_estado([turno_id], "completado")
-        invalidar()
-        flash("Turno completado y registrado en la historia clínica")
-        st.rerun()
+    if t["estado"] in PENDIENTES:
+        resta = max(0.0, float(t["total"] or 0) - float(t["sena_monto"] or 0))
+        with c2.popover("✅ Completar", width="stretch"):
+            if resta > 0:
+                st.markdown(f"Resta cobrar **{money(resta)}**"
+                            + (f" (ya pagó {money(t['sena_monto'])})" if t["sena_monto"] else ""))
+                cobro = st.number_input("Monto cobrado ($)", 0.0, value=resta, step=500.0, key=f"cobro_{turno_id}",
+                                        help="Si cobrás de más, el excedente queda como saldo a favor del cliente.")
+                medio_cobro = st.selectbox("Medio de pago", MEDIOS_PAGO, key=f"medio_cobro_{turno_id}")
+                if st.button("💵 Cobrar y completar", type="primary", key=f"cobrar_{turno_id}", width="stretch"):
+                    excedente = 0.0
+                    if cobro > 0:
+                        excedente = registrar_sena(turno_id, cobro, medio_cobro, "pago_turno",
+                                                   fecha_de_cobro(t["inicio"]))[1]
+                    cambiar_estado([turno_id], "completado")
+                    invalidar()
+                    flash(f"Turno completado. Cobro de {money(cobro)} ({medio_cobro}) registrado"
+                          + (f"; {money(excedente)} a saldo a favor" if excedente else ""), "💵")
+                    st.rerun()
+                if st.button("Completar sin registrar cobro", key=f"completar_sin_{turno_id}", width="stretch"):
+                    cambiar_estado([turno_id], "completado")
+                    invalidar()
+                    flash("Turno completado (sin cobro registrado)", "✅")
+                    st.rerun()
+            else:
+                st.caption("Ya está pago por completo.")
+                if st.button("✅ Completar", type="primary", key=f"completar_{turno_id}", width="stretch"):
+                    cambiar_estado([turno_id], "completado")
+                    invalidar()
+                    flash("Turno completado y registrado en la historia clínica")
+                    st.rerun()
     if t["estado"] in PENDIENTES:
         with c3.popover("🚫 Cancelar", width="stretch"):
             motivo = st.text_input("Motivo (opcional)", key=f"motivo_cancel_{turno_id}",
@@ -950,11 +998,15 @@ def seccion_sena(t):
     requerida = sena_requerida(total)
     estado = estado_sena(total, pagado)
     with st.container(border=True):
-        if estado == "senado":
+        if pagado >= total > 0:
+            st.success(f"✅ **Pagado por completo:** {money(pagado)}.")
+        elif estado == "senado":
             detalle = f" por {t['sena_medio']}" if t["sena_medio"] else ""
             fecha = f" el {naive(t['sena_fecha']):%d/%m/%Y %H:%M}" if t["sena_fecha"] else ""
             st.success(f"💰 **Señado:** {money(pagado)}{detalle}{fecha}. "
-                       f"Resta abonar {money(max(0, total - pagado))} el día del turno.")
+                       f"Resta abonar {money(max(0, total - pagado))}"
+                       + (" (turno completado sin cobro registrado)." if t["estado"] == "completado"
+                          else " el día del turno."))
         elif estado == "parcial":
             st.warning(f"🟠 **Seña parcial:** pagó {money(pagado)} de {money(requerida)}. "
                        f"Faltan {money(requerida - pagado)}.")
@@ -971,43 +1023,59 @@ def seccion_sena(t):
                 invalidar()
                 flash(f"Se usaron {money(al_turno)} del saldo a favor como seña", "💳")
                 st.rerun()
+        completado = t["estado"] == "completado"
         with st.form(f"sena_{turno_id}", border=False):
             c1, c2, c3 = st.columns([1, 1, 1.2], vertical_alignment="bottom")
-            monto = c1.number_input("Monto recibido ($)", 0.0, value=float(max(0, requerida - pagado)), step=500.0,
+            sugerido = falta_turno if completado else max(0, requerida - pagado)
+            monto = c1.number_input("Monto recibido ($)", 0.0, value=float(sugerido), step=500.0,
                                     help="Puede ser más que la seña. Lo que supere el precio del turno "
                                          f"({money(total)}) queda como saldo a favor del cliente.")
             medio = c2.selectbox("Medio de pago", MEDIOS_PAGO)
-            etiqueta = "💰 Registrar seña" if estado != "senado" else "💰 Registrar otro pago"
-            if c3.form_submit_button(etiqueta, type="primary" if estado != "senado" else "secondary", width="stretch"):
+            if completado:
+                etiqueta = "💵 Registrar cobro"
+            else:
+                etiqueta = "💰 Registrar seña" if estado != "senado" else "💰 Registrar otro pago"
+            destacado = (completado and falta_turno > 0) or (not completado and estado != "senado")
+            if c3.form_submit_button(etiqueta, type="primary" if destacado else "secondary", width="stretch"):
                 if monto <= 0:
                     st.error("Ingresá el monto recibido.")
                 else:
-                    al_turno, excedente = registrar_sena(turno_id, monto, medio)
+                    al_turno, excedente = registrar_sena(
+                        turno_id, monto, medio, "pago_turno" if completado else "sena",
+                        fecha_de_cobro(t["inicio"]) if completado else None)
                     invalidar()
                     flash(f"Pago de {money(monto)} registrado: {texto_pago(al_turno, excedente)}",
                           "💳" if excedente else "✅")
                     st.rerun()
-        if estado != "senado":
+        if estado != "senado" and not completado:
             url = link_wa(t["telefono"], mensaje("tpl_sena", **datos_turno_msg(t)))
             if url:
                 st.link_button("💬 Pedir la seña por WhatsApp", url)
+        pagos = db.fetch("SELECT fecha, monto, medio, tipo FROM pagos WHERE turno_id = %s ORDER BY fecha, id",
+                         (turno_id,))
+        if pagos:
+            st.caption("Pagos de este turno: " + " · ".join(
+                f"{naive(x['fecha']):%d/%m %H:%M} {TIPOS_PAGO.get(x['tipo'], x['tipo'])} "
+                f"{money(x['monto'])} ({x['medio']})" for x in pagos))
         movimientos = db.fetch("SELECT tipo, monto FROM movimientos_saldo WHERE turno_id = %s", (turno_id,))
         excedentes = sum(float(m["monto"]) for m in movimientos if m["tipo"] == "excedente_sena")
         if pagado > 0 or excedentes:
-            with st.popover("Anular seña"):
-                st.caption("Usalo solo si se cargó por error. Borra la seña del turno y los movimientos de saldo "
-                           "que generó (excedentes que quedaron a favor y saldo usado, que vuelve al cliente).")
+            with st.popover("Anular pagos"):
+                st.caption("Usalo solo si se cargó por error. Borra lo pagado del turno, sus registros de "
+                           "facturación y los movimientos de saldo que generó (excedentes que quedaron a favor y "
+                           "saldo usado, que vuelve al cliente).")
                 if excedentes and excedentes > disponible:
                     st.warning(f"Parte del excedente ({money(excedentes)}) ya se usó: el saldo del cliente va a "
                                "quedar negativo.")
-                if st.button("Sí, anular la seña", key=f"anular_sena_{turno_id}"):
+                if st.button("Sí, anular los pagos", key=f"anular_sena_{turno_id}"):
                     with db.transaction() as cur:
                         cur.execute("UPDATE turnos SET sena_monto = NULL, sena_fecha = NULL, sena_medio = NULL "
                                     "WHERE id = %s", (turno_id,))
+                        cur.execute("DELETE FROM pagos WHERE turno_id = %s", (turno_id,))
                         cur.execute("DELETE FROM movimientos_saldo WHERE turno_id = %s "
                                     "AND tipo IN ('excedente_sena', 'uso_sena')", (turno_id,))
                     invalidar()
-                    flash("Seña anulada", "↩️")
+                    flash("Pagos anulados", "↩️")
                     st.rerun()
 
 
@@ -1125,11 +1193,24 @@ def pagina_inicio():
             key="sin_cerrar",
         )
         ids = editado.loc[editado["elegir"], "id"].astype(int).tolist()
-        c1, c2, _ = st.columns([1, 1, 3])
+        c0, c1, c2, _ = st.columns([1.4, 1, 1, 1.6], vertical_alignment="bottom")
+        medio_resto = c0.selectbox("Cobro de lo que resta", ["No registrar cobro"] + MEDIOS_PAGO,
+                                   help="Al completarlos, registra el cobro de lo que faltaba pagar de cada turno "
+                                        "(con la fecha del turno) en 💵 Facturación.")
         if c1.button(f"✅ Completados ({len(ids)})", disabled=not ids, width="stretch"):
+            cobrados = 0
+            if medio_resto in MEDIOS_PAGO:
+                with db.transaction() as cur:
+                    for _, fila in sin_cerrar[sin_cerrar["id"].isin(ids)].iterrows():
+                        resta = float(fila["total"]) - float(fila["sena_monto"] or 0)
+                        if resta > 0:
+                            aplicar_pago_sena(cur, int(fila["id"]), resta, medio_resto, "pago_turno",
+                                              fecha_de_cobro(fila["inicio"]))
+                            cobrados += 1
             cambiar_estado(ids, "completado")
             invalidar()
-            flash(f"{len(ids)} turnos marcados como completados")
+            flash(f"{len(ids)} turnos marcados como completados"
+                  + (f"; {cobrados} cobros registrados ({medio_resto})" if cobrados else ""))
             st.rerun()
         if c2.button(f"🚫 Ausentes ({len(ids)})", disabled=not ids, width="stretch"):
             cambiar_estado(ids, "ausente")
@@ -1924,13 +2005,19 @@ def pagina_instrucciones():
      seña de otro turno (botón **💳 Usar saldo a favor** o al agendar) o se descuenta a mano desde la ficha.
      Al cancelar un turno señado se puede **pasar la seña a saldo a favor**.
    - En el calendario: ⚠️ sin seña (con borde rojo punteado), 🟠 parcial y 💰 señado.
-5. **Después de atender** cobrá el saldo (el detalle del turno muestra cuánto resta) y tocá
-   **✅ Marcar completado**. Eso:
+5. **Después de atender** abrí el turno, tocá **✅ Completar** y registrá el cobro de lo que resta
+   (monto y medio de pago) con **💵 Cobrar y completar**. Eso:
+   - deja el cobro registrado en **💵 Facturación**,
    - suma el importe a la facturación,
    - agrega una entrada automática en la **historia clínica**,
    - habilita el mensaje de **pedido de reseña**.
 6. **Al cerrar el día — 🏠 Inicio → Turnos pasados sin cerrar.** Marcá como *Completados* o *Ausentes*
-   los turnos que hayan quedado abiertos, así los números son reales.
+   los turnos que hayan quedado abiertos, así los números son reales. Elegí el medio en **Cobro de lo que
+   resta** para que los cobros queden registrados en Facturación.
+7. **💵 Facturación.** Todos los cobros día por día (por defecto, los últimos 2 meses): quién pagó, cuánto,
+   el motivo (seña, pago del turno o saldo a favor), el medio de pago, los tratamientos y la profesional.
+   Con filtros, gráfico por día, totales por medio y descarga a CSV. Abajo aparecen los turnos completados
+   sin cobro registrado para cargarlos.
 
 ### Estados de un turno
 | Estado | Significado |
@@ -1982,6 +2069,7 @@ en el navegador ni en otros servicios.
 | **Profesionales** | Nombre y si está activa |
 | **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
 | **Gastos fijos** | Concepto, monto mensual, si está activo y notas |
+| **Pagos** | Cada cobro: fecha y hora, cliente, turno, monto, medio de pago y motivo (seña, pago del turno, saldo a favor) |
 | **Saldo a favor** | Cada movimiento del saldo de un cliente: fecha, monto (+ ingreso / − uso), turno relacionado y motivo |
 | **Fechas especiales** | Fecha, título, si se repite todos los años y notas |
 
@@ -2322,11 +2410,143 @@ def pagina_configuracion():
             seccion()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def q_pagos(desde, hasta):
+    rows = db.fetch(
+        """SELECT p.id, p.fecha, p.monto, p.medio, p.tipo, p.concepto, p.turno_id,
+                  c.nombre || ' ' || c.apellido AS cliente, c.telefono, t.servicios, t.fecha_inicio AS turno,
+                  t.estado AS estado_turno, COALESCE(pr.nombre, t.profesional) AS profesional
+           FROM pagos p
+           JOIN clientes c ON c.id = p.cliente_id
+           LEFT JOIN turnos t ON t.id = p.turno_id
+           LEFT JOIN profesionales pr ON pr.id = t.profesional_id
+           WHERE p.fecha >= %s AND p.fecha < %s
+           ORDER BY p.fecha DESC, p.id DESC""",
+        (desde, hasta),
+    )
+    for r in rows:
+        r["fecha"] = naive(r["fecha"])
+        r["turno"] = naive(r["turno"])
+        r["monto"] = float(r["monto"])
+    return rows
+
+
+def pagina_facturacion():
+    st.title("💵 Facturación")
+    st.caption("Cada cobro registrado, día por día: señas, pagos del turno y lo que quedó como saldo a favor. "
+               "Los pagos hechos **con saldo a favor** se muestran, pero no suman al total cobrado porque no es "
+               "plata nueva (ya se contó cuando ingresó).")
+    hoy = ahora().date()
+    c1, c2, c3, c4 = st.columns([1.6, 1.4, 1.4, 1.6])
+    rango = c1.date_input("Período", (hoy - pd.DateOffset(months=2)).date(), format="DD/MM/YYYY",
+                          max_value=hoy, key="fact_desde", help="Desde esta fecha hasta hoy")
+    rango = rango if isinstance(rango, date) else hoy
+    medios = c2.multiselect("Medio de pago", MEDIOS_PAGO + [USO_SALDO], placeholder="Todos")
+    tipos = c3.multiselect("Tipo", list(TIPOS_PAGO), format_func=TIPOS_PAGO.get, placeholder="Todos")
+    buscar = c4.text_input("Cliente", placeholder="Buscar por nombre")
+
+    pagos = pd.DataFrame(q_pagos(datetime.combine(rango, datetime.min.time()),
+                                 datetime.combine(hoy + timedelta(days=1), datetime.min.time())),
+                         columns=["id", "fecha", "monto", "medio", "tipo", "concepto", "turno_id", "cliente",
+                                  "telefono", "servicios", "turno", "estado_turno", "profesional"])
+    if medios:
+        pagos = pagos[pagos["medio"].isin(medios)]
+    if tipos:
+        pagos = pagos[pagos["tipo"].isin(tipos)]
+    if buscar.strip():
+        pagos = pagos[pagos["cliente"].str.contains(buscar.strip(), case=False, na=False)]
+
+    if pagos.empty:
+        st.info("No hay cobros registrados en el período elegido.")
+    else:
+        pagos["fecha"] = pd.to_datetime(pagos["fecha"])
+        pagos["dia"] = pagos["fecha"].dt.normalize()
+        pagos["concepto_pago"] = pagos["tipo"].map(lambda x: TIPOS_PAGO.get(x, x))
+        pagos.loc[pagos["medio"] == USO_SALDO, "concepto_pago"] += " (con saldo a favor)"
+        cobrados = pagos[pagos["medio"] != USO_SALDO]
+        dias = max(1, (hoy - rango).days + 1)
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total cobrado", money(cobrados["monto"].sum()))
+        k2.metric("Cobros", len(cobrados))
+        k3.metric("Promedio por día", money(cobrados["monto"].sum() / dias))
+        k4.metric("Señas", money(cobrados.loc[cobrados["tipo"] == "sena", "monto"].sum()))
+        k5.metric("Pagos de turno", money(cobrados.loc[cobrados["tipo"] == "pago_turno", "monto"].sum()))
+        por_medio = cobrados.groupby("medio")["monto"].sum().sort_values(ascending=False)
+        st.markdown("**Por medio de pago:** " + " · ".join(f"{m} {money(v)}" for m, v in por_medio.items()))
+
+        if not cobrados.empty:
+            grafico = cobrados.pivot_table(index="dia", columns="medio", values="monto", aggfunc="sum", fill_value=0)
+            st.bar_chart(grafico, y_label="$", x_label="Día", stack=True)
+
+        st.download_button("⬇️ Descargar cobros (CSV)",
+                           pagos[["fecha", "cliente", "concepto_pago", "servicios", "turno", "profesional", "medio",
+                                  "monto"]].to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"facturacion_{rango:%Y%m%d}_{hoy:%Y%m%d}.csv", mime="text/csv")
+
+        st.subheader("📆 Día por día")
+        for i, (dia, del_dia) in enumerate(sorted(pagos.groupby("dia"), key=lambda x: x[0], reverse=True)):
+            plata = del_dia[del_dia["medio"] != USO_SALDO]
+            resumen = " · ".join(f"{m} {money(v)}" for m, v in plata.groupby("medio")["monto"].sum().items())
+            with st.expander(f"**{fecha_larga(dia).capitalize()}** — {money(plata['monto'].sum())} "
+                             f"({len(del_dia)} pago{'s' if len(del_dia) != 1 else ''})", expanded=i == 0):
+                if resumen:
+                    st.caption(resumen)
+                st.dataframe(
+                    del_dia[["fecha", "cliente", "concepto_pago", "servicios", "turno", "profesional", "medio",
+                             "monto"]],
+                    hide_index=True, width="stretch",
+                    column_config={
+                        "fecha": st.column_config.DatetimeColumn("Hora", format="HH:mm"),
+                        "cliente": "Cliente", "concepto_pago": "Motivo", "servicios": "Tratamientos",
+                        "turno": st.column_config.DatetimeColumn("Turno", format="DD/MM HH:mm"),
+                        "profesional": "Profesional", "medio": "Medio",
+                        "monto": st.column_config.NumberColumn("Monto", format="$%.0f"),
+                    })
+
+    # Turnos completados en el período con saldo pendiente: se pueden cobrar acá.
+    df = df_turnos()
+    pendientes_cobro = df[(df["estado"] == "completado") & (df["inicio"] >= pd.Timestamp(rango))
+                          & (df["total"] - df["sena_monto"] > 0)].sort_values("inicio", ascending=False)
+    if not pendientes_cobro.empty:
+        st.divider()
+        st.subheader(f"🧾 Turnos completados sin cobro registrado ({len(pendientes_cobro)})")
+        st.caption("Turnos atendidos en el período a los que les falta registrar el cobro (por ejemplo, los "
+                   "completados antes de que existiera el registro de pagos). Marcá los que quieras, elegí el medio "
+                   "y el monto, y registralos: quedan con la fecha del turno.")
+        tabla = pendientes_cobro[["id", "inicio", "cliente", "servicios", "total", "sena_monto"]].copy()
+        tabla["cobrar"] = tabla["total"] - tabla["sena_monto"]
+        tabla.insert(0, "elegir", False)
+        tabla["medio"] = "Efectivo"
+        editado = st.data_editor(
+            tabla, hide_index=True, width="stretch", key="cobros_pendientes",
+            disabled=["inicio", "cliente", "servicios", "total", "sena_monto"],
+            column_config={
+                "elegir": st.column_config.CheckboxColumn("✔"), "id": None,
+                "inicio": st.column_config.DatetimeColumn("Turno", format="DD/MM/YYYY HH:mm"),
+                "cliente": "Cliente", "servicios": "Tratamientos",
+                "total": st.column_config.NumberColumn("Precio", format="$%.0f"),
+                "sena_monto": st.column_config.NumberColumn("Ya pagó", format="$%.0f"),
+                "cobrar": st.column_config.NumberColumn("A cobrar", min_value=0, step=500, format="$%.0f"),
+                "medio": st.column_config.SelectboxColumn("Medio", options=MEDIOS_PAGO, required=True),
+            })
+        elegidos = editado[editado["elegir"] & (editado["cobrar"] > 0)]
+        if st.button(f"💵 Registrar {len(elegidos)} cobro(s)", type="primary", disabled=elegidos.empty):
+            with db.transaction() as cur:
+                for _, fila in elegidos.iterrows():
+                    aplicar_pago_sena(cur, int(fila["id"]), float(fila["cobrar"]), fila["medio"], "pago_turno",
+                                      fecha_de_cobro(fila["inicio"]))
+            invalidar()
+            flash(f"{len(elegidos)} cobro(s) registrados", "💵")
+            st.rerun()
+
+
 # --------------------------------------------------------------------------- arranque
 
 PAGINAS = {
     "🏠 Inicio": pagina_inicio,
     "📅 Agenda": pagina_agenda,
+    "💵 Facturación": pagina_facturacion,
     "👥 Clientes": pagina_clientes,
     "💄 Tratamientos": pagina_tratamientos,
     "📣 Marketing": pagina_marketing,

@@ -247,6 +247,33 @@ _MIGRATIONS = [
         tipo TEXT NOT NULL,
         concepto TEXT)""",
     "CREATE INDEX IF NOT EXISTS movimientos_saldo_cliente_idx ON movimientos_saldo (cliente_id, fecha)",
+    # Pagos: un registro por cada cobro (seña, pago del turno, excedente a saldo a favor, pago con saldo).
+    """CREATE TABLE IF NOT EXISTS pagos (
+        id SERIAL PRIMARY KEY,
+        fecha TIMESTAMP NOT NULL,
+        cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+        turno_id INTEGER REFERENCES turnos(id) ON DELETE SET NULL,
+        monto NUMERIC(12,2) NOT NULL CHECK (monto > 0),
+        medio TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        concepto TEXT)""",
+    "CREATE INDEX IF NOT EXISTS pagos_fecha_idx ON pagos (fecha)",
+    "CREATE INDEX IF NOT EXISTS pagos_turno_idx ON pagos (turno_id)",
+    # Única vez: las señas y excedentes cargados antes de existir la tabla pasan a ser pagos.
+    """INSERT INTO pagos (fecha, cliente_id, turno_id, monto, medio, tipo, concepto)
+       SELECT COALESCE(sena_fecha, fecha_inicio), cliente_id, id, sena_monto, COALESCE(sena_medio, 'No informado'),
+              'sena', 'Cargada antes del registro de pagos'
+       FROM turnos
+       WHERE COALESCE(sena_monto, 0) > 0
+         AND NOT EXISTS (SELECT 1 FROM configuracion WHERE clave = 'pagos_migrados')""",
+    r"""INSERT INTO pagos (fecha, cliente_id, turno_id, monto, medio, tipo, concepto)
+        SELECT fecha, cliente_id, turno_id, monto,
+               COALESCE(substring(concepto from '\(([^)]*)\)\s*$'), 'No informado'),
+               'saldo_a_favor', 'Cargado antes del registro de pagos'
+        FROM movimientos_saldo
+        WHERE tipo = 'excedente_sena'
+          AND NOT EXISTS (SELECT 1 FROM configuracion WHERE clave = 'pagos_migrados')""",
+    "INSERT INTO configuracion (clave, valor) VALUES ('pagos_migrados', '1') ON CONFLICT (clave) DO NOTHING",
     # Se descartó el catálogo de descuentos (nunca llegó a usarse).
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_id",
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_nombre",
