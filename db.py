@@ -237,6 +237,16 @@ _MIGRATIONS = [
         titulo TEXT NOT NULL,
         anual BOOLEAN NOT NULL DEFAULT TRUE,
         notas TEXT)""",
+    # Saldo a favor de clientes: un movimiento por cada ingreso (+) o uso (−); el saldo es la suma.
+    """CREATE TABLE IF NOT EXISTS movimientos_saldo (
+        id SERIAL PRIMARY KEY,
+        cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+        turno_id INTEGER REFERENCES turnos(id) ON DELETE SET NULL,
+        fecha TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'America/Argentina/Buenos_Aires'),
+        monto NUMERIC(12,2) NOT NULL CHECK (monto <> 0),
+        tipo TEXT NOT NULL,
+        concepto TEXT)""",
+    "CREATE INDEX IF NOT EXISTS movimientos_saldo_cliente_idx ON movimientos_saldo (cliente_id, fecha)",
     # Se descartó el catálogo de descuentos (nunca llegó a usarse).
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_id",
     "ALTER TABLE turnos DROP COLUMN IF EXISTS descuento_nombre",

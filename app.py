@@ -240,19 +240,67 @@ def chip_sena(total, pagado):
     return f'<span class="chip" style="background:{color}">{icono} {label}</span>'
 
 
-def registrar_sena(turno_id, monto, medio):
-    """Suma un pago a la seña. Si con eso queda señado, un turno reservado pasa a confirmado."""
-    with db.transaction() as cur:
+USO_SALDO = "Saldo a favor"
+
+
+def saldo_actual(cur, cliente_id):
+    cur.execute("SELECT COALESCE(SUM(monto), 0) AS saldo FROM movimientos_saldo WHERE cliente_id = %s", (cliente_id,))
+    return float(cur.fetchone()["saldo"])
+
+
+def mover_saldo(cur, cliente_id, monto, tipo, concepto, turno_id=None):
+    cur.execute("INSERT INTO movimientos_saldo (cliente_id, turno_id, fecha, monto, tipo, concepto) "
+                "VALUES (%s, %s, %s, %s, %s, %s)", (cliente_id, turno_id, ahora(), round(monto, 2), tipo, concepto))
+
+
+def aplicar_pago_sena(cur, turno_id, monto, medio):
+    """Suma un pago a la seña dentro de una transacción.
+
+    Lo que supera el precio del turno queda como saldo a favor del cliente. Si el pago se hace con saldo a
+    favor, se descuenta del saldo (nunca más de lo que falta pagar del turno ni del saldo disponible).
+    Si con el pago el turno queda señado, un turno reservado pasa a confirmado.
+    Devuelve (aplicado al turno, excedente a saldo).
+    """
+    cur.execute("SELECT cliente_id, total, sena_monto, estado, fecha_inicio FROM turnos WHERE id = %s FOR UPDATE",
+                (turno_id,))
+    t = cur.fetchone()
+    total, pagado = float(t["total"] or 0), float(t["sena_monto"] or 0)
+    falta_turno = max(0.0, total - pagado)
+    if medio == USO_SALDO:
+        monto = min(monto, falta_turno, max(0.0, saldo_actual(cur, t["cliente_id"])))
+    al_turno = min(monto, falta_turno)
+    excedente = round(monto - al_turno, 2)
+    cuando = f"{naive(t['fecha_inicio']):%d/%m}"
+    if al_turno > 0:
         cur.execute(
             """UPDATE turnos SET sena_monto = COALESCE(sena_monto, 0) + %s, sena_fecha = %s,
                       sena_medio = CASE WHEN sena_medio IS NULL OR sena_medio = %s THEN %s
                                         ELSE sena_medio || ' + ' || %s END
-               WHERE id = %s RETURNING total, sena_monto, estado""",
-            (monto, ahora(), medio, medio, medio, turno_id),
+               WHERE id = %s""",
+            (al_turno, ahora(), medio, medio, medio, turno_id),
         )
-        t = cur.fetchone()
-        if t and t["estado"] == "reservado" and estado_sena(t["total"], t["sena_monto"]) == "senado":
-            cur.execute("UPDATE turnos SET estado = 'confirmado' WHERE id = %s", (turno_id,))
+        if medio == USO_SALDO:
+            mover_saldo(cur, t["cliente_id"], -al_turno, "uso_sena", f"Usado como seña del turno del {cuando}", turno_id)
+    if excedente > 0:
+        mover_saldo(cur, t["cliente_id"], excedente, "excedente_sena",
+                    f"Excedente de seña del turno del {cuando} ({medio})", turno_id)
+    if t["estado"] == "reservado" and estado_sena(total, pagado + al_turno) == "senado":
+        cur.execute("UPDATE turnos SET estado = 'confirmado' WHERE id = %s", (turno_id,))
+    return al_turno, excedente
+
+
+def registrar_sena(turno_id, monto, medio):
+    with db.transaction() as cur:
+        return aplicar_pago_sena(cur, turno_id, monto, medio)
+
+
+def texto_pago(al_turno, excedente):
+    partes = []
+    if al_turno:
+        partes.append(f"{money(al_turno)} a la seña")
+    if excedente:
+        partes.append(f"{money(excedente)} a saldo a favor")
+    return " y ".join(partes) or "sin cambios"
 
 
 def hash_clave(clave, sal=None):
@@ -337,6 +385,17 @@ def datos_descuento(precio_lista, total):
     if not rebaja or not lista:
         return None, None
     return round(rebaja / lista * 100, 2), float(rebaja)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def q_saldos():
+    """{cliente_id: saldo a favor} solo de clientes con saldo distinto de cero."""
+    return {r["cliente_id"]: float(r["saldo"]) for r in db.fetch(
+        "SELECT cliente_id, SUM(monto) AS saldo FROM movimientos_saldo GROUP BY cliente_id HAVING SUM(monto) <> 0")}
+
+
+def saldo_cliente(cliente_id):
+    return q_saldos().get(int(cliente_id), 0.0) if cliente_id else 0.0
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -543,7 +602,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
         cli_id = st.selectbox(
             "Cliente", ids, index=ids.index(cliente_id) if cliente_id in clientes else None,
             format_func=lambda i: f"{clientes[i]['nombre']} {clientes[i]['apellido']} · "
-                                  f"{clientes[i]['telefono'] or 's/tel'}{etiqueta_proximo(proximos.get(i))}",
+                                  f"{clientes[i]['telefono'] or 's/tel'}{etiqueta_proximo(proximos.get(i))}"
+                                  f"{etiqueta_saldo(i)}",
             placeholder="Buscá por nombre, apellido o teléfono…",
         )
         if cli_id:
@@ -593,15 +653,28 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
     requerida = sena_requerida(total)
     with st.container(border=True):
         st.markdown(f"**💰 Seña ({porcentaje_sena():.0f}%): {money(requerida)}**")
+        disponible = saldo_cliente(cli_id) if modo == "Existente" else 0.0
+        usa_saldo = 0.0
+        if disponible > 0:
+            if st.checkbox(f"💳 Usar saldo a favor del cliente (disponible {money(disponible)})", value=True):
+                usa_saldo = min(disponible, requerida)
         c1, c2, c3 = st.columns([1.2, 1, 1], vertical_alignment="bottom")
-        pago_sena = c1.toggle("Ya pagó la seña")
+        pago_sena = c1.toggle("Ya pagó la seña" if not usa_saldo else "Además pagó")
         monto_sena, medio_sena = 0.0, None
         if pago_sena:
-            monto_sena = c2.number_input("Monto pagado ($)", 0.0, value=float(requerida), step=500.0)
+            monto_sena = c2.number_input("Monto pagado ($)", 0.0, value=float(max(0.0, requerida - usa_saldo)),
+                                         step=500.0, help="Puede ser más que la seña: lo que supere el precio "
+                                                          "del turno queda como saldo a favor del cliente.")
             medio_sena = c3.selectbox("Medio de pago", MEDIOS_PAGO)
-            if monto_sena < requerida:
-                st.caption(f"🟠 Quedará como seña parcial: faltan {money(requerida - monto_sena)}.")
-        else:
+        pagado_total = usa_saldo + monto_sena
+        if usa_saldo:
+            st.caption(f"💳 Se usan {money(usa_saldo)} del saldo a favor.")
+        if pagado_total > total:
+            st.caption(f"💳 Pagó {money(pagado_total - total)} más que el precio del turno: queda como **saldo a "
+                       "favor** del cliente.")
+        elif 0 < pagado_total < requerida:
+            st.caption(f"🟠 Quedará como seña parcial: faltan {money(requerida - pagado_total)}.")
+        elif not pagado_total:
             st.caption("⚠️ El turno quedará marcado **Sin seña** hasta que registres el pago desde el detalle del turno.")
 
     ini = datetime.combine(fecha, hora).replace(second=0)
@@ -640,9 +713,7 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
             return
         servicios = ", ".join(t["nombre"] for t in elegidos)
         desc_pct, desc_monto = datos_descuento(precio_lista, total)
-        con_sena = pago_sena and monto_sena > 0
-        if con_sena and estado == "reservado" and estado_sena(total, monto_sena) == "senado":
-            estado = "confirmado"
+        con_sena = (pago_sena and monto_sena > 0) or usa_saldo > 0
         with db.transaction() as cur:
             if nuevo is not None:
                 cur.execute("INSERT INTO clientes (nombre, apellido, telefono) VALUES (%s, %s, %s) RETURNING id",
@@ -650,14 +721,17 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
                 cli_id = cur.fetchone()["id"]
             cur.execute(
                 """INSERT INTO turnos (cliente_id, fecha_inicio, fecha_fin, servicios, profesional, profesional_id,
-                                       estado, notas, total, precio_lista, descuento_porcentaje,
-                                       descuento_monto, sena_monto, sena_fecha, sena_medio)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                                       estado, notas, total, precio_lista, descuento_porcentaje, descuento_monto)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (cli_id, ini, fin, servicios, prof_nombre, prof_id, estado, notas or None, total,
-                 precio_lista, desc_pct, desc_monto,
-                 monto_sena if con_sena else None, ahora() if con_sena else None, medio_sena if con_sena else None),
+                 precio_lista, desc_pct, desc_monto),
             )
             turno_id = cur.fetchone()["id"]
+            excedente = 0.0
+            if usa_saldo:
+                aplicar_pago_sena(cur, turno_id, usa_saldo, USO_SALDO)
+            if pago_sena and monto_sena > 0:
+                excedente = aplicar_pago_sena(cur, turno_id, monto_sena, medio_sena)[1]
             for t in elegidos:
                 cur.execute("INSERT INTO turno_tratamientos (turno_id, tratamiento_id, precio) VALUES (%s, %s, %s)",
                             (turno_id, t["id"], t["precio"]))
@@ -667,6 +741,8 @@ def dialogo_nuevo_turno(inicio=None, duracion=None, cliente_id=None, profesional
         flash(f"Turno agendado: {fecha_larga(ini)} {ini:%H:%M} hs" + (f" con {prof_nombre}" if prof_nombre else ""))
         if not con_sena:
             flash(f"Recordá cobrar la seña de {money(requerida)}", "⚠️")
+        if excedente:
+            flash(f"{money(excedente)} quedaron como saldo a favor del cliente", "💳")
         st.rerun()
 
 
@@ -717,15 +793,26 @@ def dialogo_turno(turno_id):
         with c3.popover("🚫 Cancelar", width="stretch"):
             motivo = st.text_input("Motivo (opcional)", key=f"motivo_cancel_{turno_id}",
                                    placeholder="Ej.: avisó que está enferma")
+            a_saldo = False
             if t["sena_monto"]:
-                st.caption(f"La seña de {money(t['sena_monto'])} queda registrada en el turno cancelado.")
+                a_saldo = st.checkbox(f"Pasar la seña ({money(t['sena_monto'])}) a saldo a favor del cliente",
+                                      key=f"sena_a_saldo_{turno_id}",
+                                      help="Si no lo marcás, la seña queda registrada en el turno cancelado.")
             if st.button("Confirmar cancelación", type="primary", key=f"cancelar_{turno_id}", width="stretch"):
                 nota = f"[Cancelado el {ahora():%d/%m/%Y %H:%M}" + (f": {motivo.strip()}]" if motivo.strip() else "]")
-                db.execute("""UPDATE turnos SET estado = 'cancelado',
-                                     notas = concat_ws(E'\\n', NULLIF(notas, ''), %s) WHERE id = %s""",
-                           (nota, turno_id))
+                with db.transaction() as cur:
+                    if a_saldo:
+                        mover_saldo(cur, t["cliente_id"], float(t["sena_monto"]), "cancelacion",
+                                    f"Seña del turno cancelado del {ini:%d/%m}", turno_id)
+                        nota += f" [Seña de {money(t['sena_monto'])} pasada a saldo a favor]"
+                        cur.execute("UPDATE turnos SET sena_monto = NULL, sena_fecha = NULL, sena_medio = NULL "
+                                    "WHERE id = %s", (turno_id,))
+                    cur.execute("""UPDATE turnos SET estado = 'cancelado',
+                                         notas = concat_ws(E'\\n', NULLIF(notas, ''), %s) WHERE id = %s""",
+                                (nota, turno_id))
                 invalidar()
-                flash("Turno cancelado (se oculta de la agenda; activá «Cancelados» para verlo)", "🚫")
+                flash("Turno cancelado (se oculta de la agenda; activá «Cancelados» para verlo)"
+                      + (f". {money(t['sena_monto'])} pasaron a saldo a favor" if a_saldo else ""), "🚫")
                 st.rerun()
     elif t["estado"] == "cancelado" and c3.button("↩️ Reactivar", width="stretch"):
         db.execute("UPDATE turnos SET estado = 'reservado' WHERE id = %s", (turno_id,))
@@ -874,29 +961,51 @@ def seccion_sena(t):
         else:
             st.error(f"⚠️ **Sin seña.** Corresponde {money(requerida)} ({porcentaje_sena():.0f}% de {money(total)}).")
 
+        disponible = saldo_cliente(t["cliente_id"])
+        falta_turno = max(0.0, total - pagado)
+        if disponible > 0 and estado != "senado" and falta_turno > 0:
+            usar = min(disponible, max(0.0, requerida - pagado))
+            if st.button(f"💳 Usar saldo a favor: {money(usar)} (disponible {money(disponible)})",
+                         key=f"usar_saldo_{turno_id}"):
+                al_turno, _ = registrar_sena(turno_id, usar, USO_SALDO)
+                invalidar()
+                flash(f"Se usaron {money(al_turno)} del saldo a favor como seña", "💳")
+                st.rerun()
+        with st.form(f"sena_{turno_id}", border=False):
+            c1, c2, c3 = st.columns([1, 1, 1.2], vertical_alignment="bottom")
+            monto = c1.number_input("Monto recibido ($)", 0.0, value=float(max(0, requerida - pagado)), step=500.0,
+                                    help="Puede ser más que la seña. Lo que supere el precio del turno "
+                                         f"({money(total)}) queda como saldo a favor del cliente.")
+            medio = c2.selectbox("Medio de pago", MEDIOS_PAGO)
+            etiqueta = "💰 Registrar seña" if estado != "senado" else "💰 Registrar otro pago"
+            if c3.form_submit_button(etiqueta, type="primary" if estado != "senado" else "secondary", width="stretch"):
+                if monto <= 0:
+                    st.error("Ingresá el monto recibido.")
+                else:
+                    al_turno, excedente = registrar_sena(turno_id, monto, medio)
+                    invalidar()
+                    flash(f"Pago de {money(monto)} registrado: {texto_pago(al_turno, excedente)}",
+                          "💳" if excedente else "✅")
+                    st.rerun()
         if estado != "senado":
-            with st.form(f"sena_{turno_id}", border=False):
-                c1, c2, c3 = st.columns([1, 1, 1.2], vertical_alignment="bottom")
-                monto = c1.number_input("Monto recibido ($)", 0.0, value=float(max(0, requerida - pagado)), step=500.0)
-                medio = c2.selectbox("Medio de pago", MEDIOS_PAGO)
-                if c3.form_submit_button("💰 Registrar seña", type="primary", width="stretch"):
-                    if monto <= 0:
-                        st.error("Ingresá el monto recibido.")
-                    else:
-                        registrar_sena(turno_id, monto, medio)
-                        invalidar()
-                        flash(f"Seña de {money(monto)} registrada")
-                        st.rerun()
             url = link_wa(t["telefono"], mensaje("tpl_sena", **datos_turno_msg(t)))
             if url:
                 st.link_button("💬 Pedir la seña por WhatsApp", url)
-        if pagado > 0:
+        movimientos = db.fetch("SELECT tipo, monto FROM movimientos_saldo WHERE turno_id = %s", (turno_id,))
+        excedentes = sum(float(m["monto"]) for m in movimientos if m["tipo"] == "excedente_sena")
+        if pagado > 0 or excedentes:
             with st.popover("Anular seña"):
-                st.caption("Usalo solo si se cargó por error. Si el cliente canceló, la seña queda registrada "
-                           "en el turno cancelado.")
+                st.caption("Usalo solo si se cargó por error. Borra la seña del turno y los movimientos de saldo "
+                           "que generó (excedentes que quedaron a favor y saldo usado, que vuelve al cliente).")
+                if excedentes and excedentes > disponible:
+                    st.warning(f"Parte del excedente ({money(excedentes)}) ya se usó: el saldo del cliente va a "
+                               "quedar negativo.")
                 if st.button("Sí, anular la seña", key=f"anular_sena_{turno_id}"):
-                    db.execute("UPDATE turnos SET sena_monto = NULL, sena_fecha = NULL, sena_medio = NULL "
-                               "WHERE id = %s", (turno_id,))
+                    with db.transaction() as cur:
+                        cur.execute("UPDATE turnos SET sena_monto = NULL, sena_fecha = NULL, sena_medio = NULL "
+                                    "WHERE id = %s", (turno_id,))
+                        cur.execute("DELETE FROM movimientos_saldo WHERE turno_id = %s "
+                                    "AND tipo IN ('excedente_sena', 'uso_sena')", (turno_id,))
                     invalidar()
                     flash("Seña anulada", "↩️")
                     st.rerun()
@@ -1314,6 +1423,11 @@ def etiqueta_proximo(turnos):
     return f" · 📅 {DIAS_CORTOS[t['inicio'].weekday()]} {t['inicio']:%d/%m %H:%M}{extra}"
 
 
+def etiqueta_saldo(cliente_id):
+    saldo = saldo_cliente(cliente_id)
+    return f" · 💳 {money(saldo)} a favor" if saldo > 0 else ""
+
+
 def lista_proximos_turnos(turnos, prefijo):
     for t in turnos:
         c1, c2, c3, c4 = st.columns([2.2, 4, 2, 0.8], vertical_alignment="center")
@@ -1323,6 +1437,40 @@ def lista_proximos_turnos(turnos, prefijo):
         c3.markdown(f"{chip(t['estado'])}<br>{chip_sena(t['total'], t['sena_monto'])}", unsafe_allow_html=True)
         if c4.button("🔍", key=f"{prefijo}_{t['id']}", help="Abrir turno", width="stretch"):
             abrir_dialogo("turno", turno_id=int(t["id"]))
+
+
+def seccion_saldo(cliente_id):
+    saldo = saldo_cliente(cliente_id)
+    movimientos = db.fetch("SELECT fecha, monto, concepto FROM movimientos_saldo WHERE cliente_id = %s "
+                           "ORDER BY fecha DESC, id DESC", (cliente_id,))
+    titulo = (f"💳 Saldo a favor: **{money(saldo)}**" if saldo > 0 else
+              f"💳 Saldo: **{money(saldo)}** (negativo)" if saldo < 0 else "💳 Sin saldo a favor")
+    with st.expander(titulo, expanded=saldo != 0):
+        st.caption("Se suma cuando un pago supera el precio del turno o al pasar la seña de un turno cancelado. "
+                   "Se usa como seña de otro turno desde el detalle del turno, o se ajusta acá a mano.")
+        with st.form(f"ajuste_saldo_{cliente_id}", border=False):
+            c1, c2, c3, c4 = st.columns([1.3, 1, 2, 1], vertical_alignment="bottom")
+            accion = c1.selectbox("Movimiento", ["Descontar (se usó)", "Sumar"])
+            monto = c2.number_input("Monto ($)", 0.0, step=500.0)
+            concepto = c3.text_input("Motivo", placeholder="Ej.: pagó el saldo del turno con su saldo a favor")
+            if c4.form_submit_button("Guardar", width="stretch"):
+                if monto <= 0 or not concepto.strip():
+                    st.error("Ingresá el monto y el motivo.")
+                else:
+                    signo = -1 if accion.startswith("Descontar") else 1
+                    with db.transaction() as cur:
+                        mover_saldo(cur, cliente_id, signo * monto, "ajuste", concepto.strip())
+                    invalidar()
+                    flash(f"Saldo {'descontado' if signo < 0 else 'sumado'}: {money(monto)}", "💳")
+                    st.rerun()
+        if movimientos:
+            vista = pd.DataFrame(movimientos)
+            vista["fecha"] = pd.to_datetime(vista["fecha"])
+            vista["monto"] = vista["monto"].astype(float)
+            st.dataframe(vista, hide_index=True, width="stretch", column_config={
+                "fecha": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY HH:mm"),
+                "monto": st.column_config.NumberColumn("Monto", format="$%.0f"),
+                "concepto": "Motivo"})
 
 
 def ficha_cliente(c, turnos):
@@ -1338,6 +1486,7 @@ def ficha_cliente(c, turnos):
     k2.metric("Total gastado", money(c["gastado"]))
     k3.metric("Última visita", c["ultima_visita"].strftime("%d/%m/%Y") if pd.notna(c["ultima_visita"]) else "—")
     k4.metric("Próximo turno", c["proximo_turno"].strftime("%d/%m %H:%M") if pd.notna(c["proximo_turno"]) else "—")
+    seccion_saldo(int(c["id"]))
 
     b1, b2, _ = st.columns([1, 1, 2])
     if b1.button("📅 Agendar turno", type="primary", width="stretch"):
@@ -1450,7 +1599,7 @@ def pagina_clientes():
     proximos = proximos_turnos()
     nombres = {int(c["id"]): f"{c['apellido']}, {c['nombre']} · "
                              f"{c['telefono'] if isinstance(c['telefono'], str) and c['telefono'] else 's/tel'}"
-                             f"{etiqueta_proximo(proximos.get(int(c['id'])))}"
+                             f"{etiqueta_proximo(proximos.get(int(c['id'])))}{etiqueta_saldo(c['id'])}"
                for _, c in clientes.iterrows()}
     if ss.get("cliente_sel") not in nombres:
         ss.cliente_sel = None
@@ -1770,6 +1919,10 @@ def pagina_instrucciones():
      monto y tus datos para transferir) y, cuando llegue el comprobante, abrí el turno y tocá **💰 Registrar seña**.
    - Se pueden registrar pagos parciales: el turno queda **🟠 Seña parcial** hasta completar el monto.
    - Al quedar señado, un turno *Reservado* pasa solo a **Confirmado**.
+   - **Saldo a favor:** si alguien paga **más que el precio del turno**, lo que sobra queda como saldo a favor
+     del cliente (se ve en el buscador con 💳 y en su ficha, con todos los movimientos). Ese saldo se usa como
+     seña de otro turno (botón **💳 Usar saldo a favor** o al agendar) o se descuenta a mano desde la ficha.
+     Al cancelar un turno señado se puede **pasar la seña a saldo a favor**.
    - En el calendario: ⚠️ sin seña (con borde rojo punteado), 🟠 parcial y 💰 señado.
 5. **Después de atender** cobrá el saldo (el detalle del turno muestra cuánto resta) y tocá
    **✅ Marcar completado**. Eso:
@@ -1829,6 +1982,7 @@ en el navegador ni en otros servicios.
 | **Profesionales** | Nombre y si está activa |
 | **Configuración** | Nombre del negocio, link de reseñas, porcentaje de seña, datos para transferir, plantillas de mensajes y contraseña (cifrada) |
 | **Gastos fijos** | Concepto, monto mensual, si está activo y notas |
+| **Saldo a favor** | Cada movimiento del saldo de un cliente: fecha, monto (+ ingreso / − uso), turno relacionado y motivo |
 | **Fechas especiales** | Fecha, título, si se repite todos los años y notas |
 
 **Qué *no* se guarda:** el cobro del saldo el día del turno (solo el precio final), comprobantes de pago,
